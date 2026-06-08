@@ -762,8 +762,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
         Output columns:
         - channel
-        - row
-        - col
+        - row (electrode y)
+        - col (electrode x)
         """
         try:
             from openpyxl import Workbook
@@ -775,7 +775,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         worksheet.title = "array"
         worksheet.append(["channel", "row", "col"])
         for model in sorted(self.electrodes.values(), key=lambda m: (m.channel_index, m.eid)):
-            worksheet.append([model.channel_index, model.x, model.y])
+            worksheet.append([model.channel_index, model.y, model.x])
         workbook.save(path)
 
     def _update_duplicate_flags(self) -> tuple[list[int], list[str], int]:
@@ -964,13 +964,13 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """
         Create regular rows x cols grid with pitch spacing.
 
-        Electrodes at (c*pitch, r*pitch), eid = 0..rows*cols-1.
+        Electrodes at (r*pitch, c*pitch), eid = 0..rows*cols-1.
         """
         models: list[Electrode] = []
         eid = 0
         for r in range(rows):
             for c in range(cols):
-                models.append(Electrode(eid=eid, x=c * pitch, y=r * pitch, channel_index=eid, contact_id="A-000"))
+                models.append(Electrode(eid=eid, x=r * pitch, y=c * pitch, channel_index=eid, contact_id="A-000"))
                 eid += 1
         self._set_electrodes(models)
 
