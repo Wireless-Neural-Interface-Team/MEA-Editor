@@ -41,11 +41,11 @@ def main():
             "--onefile",
             "--clean",
             "--distpath", str(output_dir),
-            "--specpath", tmp,  # spec créé dans le dossier temporaire
+            "--specpath", tmp,
             str(launcher.resolve()),
         ]
-    subprocess.run(cmd, check=True, cwd=Path.cwd())
-    print(f"\n✓ Executable created: {exe_path}")
+        subprocess.run(cmd, check=True, cwd=Path.cwd())
+    print(f"\nExecutable created: {exe_path}")
 
 
 if __name__ == "__main__":

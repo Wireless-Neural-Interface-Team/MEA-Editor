@@ -13,6 +13,8 @@ Architecture overview
 from __future__ import annotations
 
 from collections import Counter
+import importlib
+import threading
 
 try:
     from PySide6.QtCore import QPoint, QRectF, QTimer, Qt
@@ -106,6 +108,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._startup_done = False
+        self._preload_thread: threading.Thread | None = None
+        self._preload_started = False
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         """
@@ -221,28 +225,17 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.dx_edit = QLineEdit("0")
         self.dy_edit = QLineEdit("0")
 
-        b_radius = QPushButton("Apply Radius")
-        b_radius.clicked.connect(self._apply_radius)
-        b_xy = QPushButton("Apply X/Y")
-        b_xy.clicked.connect(self._apply_xy_single)
-        b_channel = QPushButton("Apply Channel")
-        b_channel.clicked.connect(self._apply_channel_index)
-        b_contact = QPushButton("Apply Contact ID")
-        b_contact.clicked.connect(self._apply_contact_id)
-        b_plane = QPushButton("Apply Contact Plane Axis")
-        b_plane.clicked.connect(self._apply_contact_plane_axis)
-        b_shank = QPushButton("Apply Shank ID")
-        b_shank.clicked.connect(self._apply_shank_id)
-        b_shape = QPushButton("Apply Shape")
-        b_shape.clicked.connect(self._apply_shape)
+        self.b_apply_edits = QPushButton("Confirm electrode edits")
+        self.b_apply_edits.clicked.connect(self._apply_pending_edits)
 
-        e_form.addRow("Radius", make_row(self.radius_edit, b_radius))
-        e_form.addRow("X/Y (single)", make_row(self.x_edit, self.y_edit, b_xy))
-        e_form.addRow("Channel index", make_row(self.channel_index_edit, b_channel))
-        e_form.addRow("Contact ID", make_row(self.contact_id_edit, b_contact))
-        e_form.addRow("Contact plane axis", make_row(self.contact_plane_axis_edit, b_plane))
-        e_form.addRow("Shank ID", make_row(self.shank_id_edit, b_shank))
-        e_form.addRow("Shape", make_row(self.shape_combo, b_shape))
+        e_form.addRow("Radius", self.radius_edit)
+        e_form.addRow("X/Y (single)", make_row(self.x_edit, self.y_edit))
+        e_form.addRow("Channel index", self.channel_index_edit)
+        e_form.addRow("Contact ID", self.contact_id_edit)
+        e_form.addRow("Contact plane axis", self.contact_plane_axis_edit)
+        e_form.addRow("Shank ID", self.shank_id_edit)
+        e_form.addRow("Shape", self.shape_combo)
+        e_form.addRow(self.b_apply_edits)
         panel_layout.addWidget(edit_box)
 
         # Move block: dX, dY to move selection.
@@ -516,6 +509,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         If user cancels or fails to open/create, close application.
         Called after main window is shown so it appears as a proper window.
         """
+        self._start_dependency_preload()
         msg = QMessageBox(self)
         msg.setWindowTitle("Electrode Array Editor")
         msg.setText("Choose how to start:")
@@ -542,6 +536,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         Returns:
             True if grid was created, False if cancelled.
         """
+        self._start_dependency_preload()
         dialog = NewArrayDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return False
@@ -563,6 +558,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         Returns:
             True if loaded successfully, False if cancelled or error.
         """
+        self._start_dependency_preload()
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Open array JSON",
@@ -583,6 +579,29 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.raise_()
         self.activateWindow()
         return True
+
+    def _start_dependency_preload(self) -> None:
+        """
+        Preload optional heavy dependencies in background.
+
+        This runs while the user is choosing a file or defining a matrix, so
+        later file I/O actions are less likely to pause on first import.
+        """
+        if self._preload_started:
+            return
+        self._preload_started = True
+
+        def _preload() -> None:
+            for module_name in ("probeinterface", "pandas", "openpyxl"):
+                try:
+                    importlib.import_module(module_name)
+                except Exception:
+                    # Keep startup non-blocking; missing modules are handled
+                    # later with explicit user-facing error messages.
+                    pass
+
+        self._preload_thread = threading.Thread(target=_preload, daemon=True, name="dependency-preload")
+        self._preload_thread.start()
 
     def _menu_open_array(self) -> None:
         """Menu handler for Open action with unsaved-work protection."""
@@ -743,8 +762,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
         Output columns:
         - channel
-        - row
-        - col
+        - row (electrode y)
+        - col (electrode x)
         """
         try:
             from openpyxl import Workbook
@@ -756,7 +775,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         worksheet.title = "array"
         worksheet.append(["channel", "row", "col"])
         for model in sorted(self.electrodes.values(), key=lambda m: (m.channel_index, m.eid)):
-            worksheet.append([model.channel_index, model.x, model.y])
+            worksheet.append([model.channel_index, model.y, model.x])
         workbook.save(path)
 
     def _update_duplicate_flags(self) -> tuple[list[int], list[str], int]:
@@ -766,18 +785,22 @@ class ElectrodeArrayEditorQt(QMainWindow):
         Returns:
             (duplicate_channels, duplicate_contacts, empty_contact_count).
         """
-        # Count channel_index and contact_id to detect duplicates.
-        channel_counts = Counter(model.channel_index for model in self.electrodes.values())
+        # Count (shank_id, channel_index) so same channel on different shanks
+        # is allowed and does not trigger duplicate highlighting.
+        channel_key_counts = Counter(
+            (str(model.shank_id).strip(), model.channel_index) for model in self.electrodes.values()
+        )
         contact_counts = Counter(model.contact_id for model in self.electrodes.values())
-        duplicate_channels = sorted(value for value, count in channel_counts.items() if count > 1)
+        duplicate_channel_keys = {key for key, count in channel_key_counts.items() if count > 1}
+        duplicate_channels = sorted({channel for _, channel in duplicate_channel_keys})
         # Ignore empty contact_id in duplicate highlighting.
         duplicate_contacts = sorted(v for v, c in contact_counts.items() if c > 1 and v.strip() != "")
         empty_contact_count = contact_counts.get("", 0)
-        dup_channel_set = set(duplicate_channels)
         dup_contact_set = set(duplicate_contacts)
         # Mark each model according to whether it is a duplicate.
         for model in self.electrodes.values():
-            model.has_channel_duplicate = model.channel_index in dup_channel_set
+            model_key = (str(model.shank_id).strip(), model.channel_index)
+            model.has_channel_duplicate = model_key in duplicate_channel_keys
             model.has_contact_duplicate = model.contact_id in dup_contact_set
         for item in self.items.values():
             item._refresh_style()
@@ -941,13 +964,13 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """
         Create regular rows x cols grid with pitch spacing.
 
-        Electrodes at (c*pitch, r*pitch), eid = 0..rows*cols-1.
+        Electrodes at (r*pitch, c*pitch), eid = 0..rows*cols-1.
         """
         models: list[Electrode] = []
         eid = 0
         for r in range(rows):
             for c in range(cols):
-                models.append(Electrode(eid=eid, x=c * pitch, y=r * pitch, channel_index=eid, contact_id="A-000"))
+                models.append(Electrode(eid=eid, x=r * pitch, y=c * pitch, channel_index=eid, contact_id="A-000"))
                 eid += 1
         self._set_electrodes(models)
 
@@ -1162,6 +1185,99 @@ class ElectrodeArrayEditorQt(QMainWindow):
         for item in selected:
             item.model.shape = value
             item.sync_from_model()
+        self._refresh_panel_values()
+        self._commit_if_changed(before)
+
+    def _apply_pending_edits(self) -> None:
+        """
+        Apply all non-empty edit-panel fields in one confirmation action.
+
+        Empty text fields are treated as "no change". For X/Y, both values must
+        be provided together and require exactly one selected electrode.
+        """
+        selected = self._selected_items()
+        if not selected:
+            return
+
+        radius_text = self.radius_edit.text().strip()
+        x_text = self.x_edit.text().strip()
+        y_text = self.y_edit.text().strip()
+        channel_text = self.channel_index_edit.text().strip()
+        contact_text = self.contact_id_edit.text().strip()
+        plane_text = self.contact_plane_axis_edit.text().strip()
+        shank_raw_text = self.shank_id_edit.text()
+        shank_text = shank_raw_text
+        shape_value = self.shape_combo.currentText().strip().lower() or "circle"
+
+        if shape_value != "circle":
+            shape_value = "circle"
+
+        if (x_text and not y_text) or (y_text and not x_text):
+            QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
+            return
+        if (x_text or y_text) and len(selected) != 1:
+            QMessageBox.information(self, "Single selection required", "X/Y edition requires exactly one electrode.")
+            return
+
+        before = self._capture_state()
+
+        radius_value: float | None = None
+        if radius_text:
+            try:
+                radius_value = float(radius_text)
+                if radius_value <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.critical(self, "Invalid radius", "Radius must be a positive number.")
+                return
+
+        x_value: float | None = None
+        y_value: float | None = None
+        if x_text and y_text:
+            try:
+                x_value = float(x_text)
+                y_value = float(y_text)
+            except ValueError:
+                QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
+                return
+
+        channel_value: int | None = None
+        if channel_text:
+            try:
+                channel_value = int(channel_text)
+            except ValueError:
+                QMessageBox.critical(self, "Invalid channel index", "Channel index must be an integer.")
+                return
+
+        plane_value: tuple[float, float, float, float] | None = None
+        if plane_text:
+            plane_value = self._parse_contact_plane_axis_text(plane_text)
+            if plane_value is None:
+                QMessageBox.critical(self, "Invalid contact plane axis", "Use 4 values: x0, x1, y0, y1.")
+                return
+
+        if contact_text == "" and self.contact_id_edit.text() != "":
+            QMessageBox.information(self, "No values", "Fill Contact ID before applying.")
+            return
+
+        for item in selected:
+            if radius_value is not None:
+                item.set_radius(radius_value)
+            if channel_value is not None:
+                item.model.channel_index = channel_value
+            if contact_text:
+                item.model.contact_id = contact_text
+            if plane_value is not None:
+                item.model.contact_plane_axis = plane_value
+            if shank_raw_text != "":
+                item.model.shank_id = shank_text
+            item.model.shape = shape_value
+            item.sync_from_model()
+
+        if x_value is not None and y_value is not None:
+            selected[0].setPos(x_value, y_value)
+
+        self._update_duplicate_flags()
         self._refresh_panel_values()
         self._commit_if_changed(before)
 
