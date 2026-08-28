@@ -33,6 +33,7 @@ def main():
             sys.exit(1)
 
     launcher = SCRIPT_DIR / "run_mea_editor.py"
+    project_root = SCRIPT_DIR.parent
     with tempfile.TemporaryDirectory() as tmp:
         cmd = [
             sys.executable, "-m", "PyInstaller",
@@ -40,6 +41,16 @@ def main():
             "--windowed",
             "--onefile",
             "--clean",
+            "--noconfirm",
+            "--paths", str(project_root),
+            "--hidden-import=PySide6.QtCore",
+            "--hidden-import=PySide6.QtGui",
+            "--hidden-import=PySide6.QtWidgets",
+            "--hidden-import=openpyxl",
+            "--hidden-import=mea_editor.contact_shape",
+            "--hidden-import=mea_editor.pad_layout",
+            "--hidden-import=mea_editor.attribute_schema",
+            "--collect-submodules=mea_editor",
             "--distpath", str(output_dir),
             "--specpath", tmp,
             str(launcher.resolve()),

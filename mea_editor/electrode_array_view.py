@@ -10,7 +10,7 @@ Responsibilities:
 from __future__ import annotations
 
 try:
-    from PySide6.QtCore import Qt
+    from PySide6.QtCore import QPointF, QRectF, Qt
     from PySide6.QtGui import QColor, QPainter, QPen
     from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView
 except ImportError as exc:
@@ -21,6 +21,8 @@ AXIS_BAND_HEIGHT = 24
 AXIS_BAND_WIDTH = 52
 # Min pixel distance between axis tick labels to avoid overlap.
 GRID_MIN_LABEL_SPACING_PX = 44
+# Keep contact labels inside the plot area when fitting.
+FIT_LABEL_MARGIN_PX = 28.0
 
 
 class ElectrodeArrayView(QGraphicsView):
@@ -44,7 +46,7 @@ class ElectrodeArrayView(QGraphicsView):
         # Antialiasing improves circle and text rendering quality.
         self.setRenderHint(QPainter.Antialiasing, True)
         self.setFrameShape(QFrame.NoFrame)
-        # Keep content centered when viewport is larger than scene.
+        # Keep content centered when the transformed scene is smaller than the view.
         self.setAlignment(Qt.AlignCenter)
         # Rubber-band drag enables box selection on empty area.
         self.setDragMode(QGraphicsView.RubberBandDrag)
@@ -54,12 +56,17 @@ class ElectrodeArrayView(QGraphicsView):
         # Cartesian orientation for scene coordinates: Y grows upward.
         # Qt view Y is naturally downward; scale(1,-1) flips it.
         self.scale(1.0, -1.0)
+        # Pan is middle-drag; hiding scrollbars keeps the viewport size
+        # stable so fit/center is not shifted by a late scrollbar.
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._interaction_begin = lambda: None
         self._interaction_end = lambda: None
         self._is_add_mode = lambda: False
-        self._add_electrode_at = lambda x, y: None
+        self._add_at = lambda x, y: None
         self._on_delete = lambda: None
         self._on_view_transform_changed = lambda: None
+        self._on_activated = lambda: None
         self._is_middle_panning = False
         self._last_pan_pos = None
 
@@ -76,16 +83,16 @@ class ElectrodeArrayView(QGraphicsView):
         self._interaction_begin = on_begin
         self._interaction_end = on_end
 
-    def set_add_callbacks(self, is_add_mode, add_electrode_at) -> None:
+    def set_add_callbacks(self, is_add_mode, add_at) -> None:
         """
-        Register callbacks for add-electrode mode.
+        Register callbacks for add-point mode (electrode or pad).
 
         Args:
             is_add_mode: Function returning True if add mode is active.
-            add_electrode_at: Function(x, y) creating an electrode at the given position.
+            add_at: Function(x, y) creating a point at the given position.
         """
         self._is_add_mode = is_add_mode
-        self._add_electrode_at = add_electrode_at
+        self._add_at = add_at
 
     def set_delete_callback(self, on_delete) -> None:
         """
@@ -99,10 +106,64 @@ class ElectrodeArrayView(QGraphicsView):
         """
         self._on_view_transform_changed = on_changed
 
+    def set_activated_callback(self, on_activated) -> None:
+        """Register callback when this viewport is clicked or zoomed."""
+        self._on_activated = on_activated
+
+    def fit_scene_rect(self, rect: QRectF) -> None:
+        """
+        Frame `rect` in the plot area (viewport minus axis bands), Y-up.
+
+        `QGraphicsView.fitInView` uses the full viewport, then a scrollbar
+        nudge for the axis bands. That nudge is clamped when the framed
+        rect is almost as large as the scene (typical for pads), so the
+        view ends up off-center. This fits and centers in the usable area.
+        """
+        if rect.width() <= 0 or rect.height() <= 0:
+            return
+
+        prev_size = None
+        for _ in range(4):
+            vp = self.viewport().rect()
+            size = (vp.width(), vp.height())
+            if size[0] <= 1 or size[1] <= 1:
+                return
+            if size == prev_size:
+                break
+            prev_size = size
+
+            axis_w = float(AXIS_BAND_WIDTH)
+            axis_h = float(AXIS_BAND_HEIGHT)
+            usable_w = max(vp.width() - axis_w, 1.0)
+            usable_h = max(vp.height() - axis_h, 1.0)
+
+            def scale_to_fit(framed: QRectF) -> float:
+                return min(
+                    usable_w / max(framed.width(), 1e-9),
+                    usable_h / max(framed.height(), 1e-9),
+                )
+
+            scale = scale_to_fit(rect)
+            label_pad = FIT_LABEL_MARGIN_PX / max(scale, 1e-9)
+            framed = rect.adjusted(-label_pad, -label_pad, label_pad, label_pad)
+            scale = scale_to_fit(framed)
+
+            self.resetTransform()
+            self.scale(scale, -scale)
+            target = QPointF(axis_w + usable_w / 2.0, axis_h + usable_h / 2.0)
+            current = self.mapFromScene(framed.center())
+            self.horizontalScrollBar().setValue(
+                int(round(self.horizontalScrollBar().value() + current.x() - target.x()))
+            )
+            self.verticalScrollBar().setValue(
+                int(round(self.verticalScrollBar().value() + current.y() - target.y()))
+            )
+
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         """
         Handle mouse click: add mode or start interaction for undo.
         """
+        self._on_activated()
         # Middle button drag pans the view.
         if event.button() == Qt.MiddleButton:
             self._is_middle_panning = True
@@ -113,10 +174,10 @@ class ElectrodeArrayView(QGraphicsView):
 
         # Left button only.
         if event.button() == Qt.LeftButton:
-            # In add mode, left-click creates an electrode at cursor position.
+            # In add mode, left-click creates an electrode or pad at cursor position.
             if self._is_add_mode():
                 scene_pos = self.mapToScene(event.pos())
-                self._add_electrode_at(scene_pos.x(), scene_pos.y())
+                self._add_at(scene_pos.x(), scene_pos.y())
                 event.accept()
                 return
             # Otherwise, record state for potential undo on drag end.
@@ -169,6 +230,7 @@ class ElectrodeArrayView(QGraphicsView):
         Store scene point under cursor, apply scale, then adjust scrollbars
         so that point remains under the cursor.
         """
+        self._on_activated()
         # event.position() is Qt6; event.pos() fallback for older APIs.
         try:
             mouse_pos = event.position().toPoint()

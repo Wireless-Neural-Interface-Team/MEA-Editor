@@ -1,43 +1,121 @@
 """
 I/O layer for the electrode array editor.
 
-Supported inputs:
-1) probeinterface JSON (preferred)
-2) legacy custom editor JSON
+Native format (Save / Open):
+    mea_editor JSON — electrodes, pads, extra attributes, shapes.
+    No probeinterface dependency.
 
-Output:
-- probeinterface JSON only (for compatibility with the rest of the pipeline).
+Legacy inputs still accepted:
+    1) mea_editor JSON (current)
+    2) older custom editor JSON (channel_index / contact_id)
+    3) probeinterface JSON (migrated into native fields)
+
+SpikeInterface export:
+    probeinterface JSON for recording contacts only (not pads), with:
+    - device_channel_indices = channel ID derived from INTAN ID
+    - contact_ids = Contact ID from Manufacturer ID (fallback: INTAN ID)
+    - contact_annotations = native IDs, extras, and linked pad IDs
+      so a file exported from this editor can be reopened with less data loss
+
+XLSX exports:
+    analysis table (channel / row / col) and a full array workbook
+    (electrodes sheet + pads sheet).
 """
 
 from __future__ import annotations
 
 import json
+import re
+from collections import Counter
 from typing import Any
 
-import numpy as np
+from ._version import __version__ as EDITOR_VERSION
+from .attribute_schema import (
+    AttributeSpec,
+    coerce_value,
+    extra_specs,
+    fill_electrodes_extras,
+    schema_from_payload,
+    schema_to_payload,
+)
+from .contact_shape import (
+    DEFAULT_ELECTRODE_SHAPE,
+    DEFAULT_PAD_SHAPE,
+    extents_from_probe_params,
+    normalize_contact_shape,
+    probe_shape_params,
+)
+from .electrode import (
+    BUILTIN_ATTRIBUTE_KEYS,
+    DEFAULT_INTAN_ID,
+    DEFAULT_MANUFACTURER_ID,
+    DEFAULT_PLANE_AXIS,
+    DEFAULT_RADIUS,
+    DEFAULT_SHAPE,
+    Electrode,
+)
+from .pad import (
+    DEFAULT_INTERFACE_ID,
+    DEFAULT_PAD_RADIUS,
+    DEFAULT_SYSTEM_ID,
+    Pad,
+)
 
-from .electrode import Electrode
-
-DEFAULT_RADIUS = 12.0
+NATIVE_SPECIFICATION = "mea_editor"
+NATIVE_VERSION = "1.4"
 MIN_RADIUS = 0.001
-DEFAULT_CONTACT_ID = "A-000"
-DEFAULT_SHAPE = "circle"
-DEFAULT_PLANE_AXIS = (1.0, 0.0, 0.0, 1.0)
 DEFAULT_UNITS = "um"
+PROBEINTERFACE_SPEC = "probeinterface"
+PROBEINTERFACE_VERSION = "0.3.1"
+INTAN_CHANNELS_PER_PORT = 32
+SI_CHANNEL_ID_KEY = "channel ID"
+SI_CONTACT_ID_KEY = "Contact ID"
+NATIVE_CONTACT_ANNOTATION_KEYS = frozenset(
+    {
+        SI_CHANNEL_ID_KEY,
+        SI_CONTACT_ID_KEY,
+        "channel_id",
+        "contact_id",
+        "potentiostat_id",
+        "intan_id",
+        "manufacturer_id",
+        "shank_id",
+        "pad_interface_id",
+        "pad_system_id",
+        "eid",
+    }
+)
+
+_INTAN_PORT_RE = re.compile(r"^([A-Z])[\-_]?(\d+)$", re.IGNORECASE)
+_INTAN_NC_RE = re.compile(r"^NC(\d*)$", re.IGNORECASE)
+
+_ELECTRODE_KNOWN_KEYS = frozenset(
+    {
+        "eid",
+        "x",
+        "y",
+        "radius",
+        "height",
+        "enabled",
+        "potentiostat_id",
+        "intan_id",
+        "manufacturer_id",
+        "contact_plane_axis",
+        "shank_id",
+        "shape",
+        "channel_index",
+        "contact_id",
+        "attributes",
+        "extra",
+    }
+)
 
 
-def _parse_contact_plane_axis(raw_value) -> tuple[float, float, float, float]:
+def _parse_contact_plane_axis(raw_value: Any) -> tuple[float, float, float, float]:
     """
     Parse contact plane axis from generic input (list/tuple).
 
     Expected order: (plane_axis_x_0, plane_axis_x_1, plane_axis_y_0, plane_axis_y_1).
-    Returns DEFAULT_PLANE_AXIS on invalid input (type, length, conversion).
-
-    Args:
-        raw_value: List or tuple of 4 numeric values.
-
-    Returns:
-        Tuple (x0, x1, y0, y1) or DEFAULT_PLANE_AXIS.
     """
     if not isinstance(raw_value, (list, tuple)) or len(raw_value) != 4:
         return DEFAULT_PLANE_AXIS
@@ -48,173 +126,866 @@ def _parse_contact_plane_axis(raw_value) -> tuple[float, float, float, float]:
     return (x0, x1, y0, y1)
 
 
-def _is_valid_value(value: Any) -> bool:
+def _as_float(value: Any, default: float) -> float:
+    try:
+        if value is None:
+            return default
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number:  # NaN
+        return default
+    return number
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        if value is None or isinstance(value, bool):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_str(value: Any, default: str) -> str:
+    if value is None:
+        return default
+    text = str(value).strip() if isinstance(value, str) else str(value)
+    return text if text != "" or default == "" else default
+
+
+def si_units_for_probeinterface(si_units: str) -> str:
+    """Map editor units onto the probeinterface enum (`um` or `mm`)."""
+    text = (si_units or DEFAULT_UNITS).strip()
+    lowered = text.lower()
+    if lowered in {"um", "micron", "microns", "micrometer", "micrometre"} or text in {"µm", "μm"}:
+        return "um"
+    if lowered in {"mm", "millimeter", "millimetre", "millimeters", "millimetres"}:
+        return "mm"
+    return "um"
+
+
+def _annotation_at(annotations: Any, key: str, index: int) -> Any:
+    if not isinstance(annotations, dict):
+        return None
+    values = annotations.get(key)
+    if isinstance(values, list) and index < len(values):
+        return values[index]
+    return None
+
+
+def _first_pad_by_electrode(pads: list[Pad] | None) -> dict[int, Pad]:
+    """Map each electrode eid to its first pad (lowest pid). Later pads are ignored."""
+    mapping: dict[int, Pad] = {}
+    for pad in sorted(pads or [], key=lambda item: item.pid):
+        mapping.setdefault(pad.electrode_eid, pad)
+    return mapping
+
+
+def _contact_plane_axis_text(axis: tuple[float, float, float, float]) -> str:
+    return ", ".join(f"{value:g}" for value in axis)
+
+
+def format_intan_id(index: int, channels_per_port: int = INTAN_CHANNELS_PER_PORT) -> str:
     """
-    Check if value is valid (non-NaN).
+    Build a unique INTAN ID from a sequential index.
 
-    NaN != NaN in Python, so value == value returns False for NaN.
-    Compatible with DataFrame scalar values.
+    0 -> A-000, 31 -> A-031, 32 -> B-000. Indexes beyond Z wrap to a plain integer.
     """
-    return value == value
+    if index < 0:
+        raise ValueError("INTAN index must be >= 0.")
+    port = index // channels_per_port
+    channel = index % channels_per_port
+    if port >= 26:
+        return str(index)
+    return f"{chr(ord('A') + port)}-{channel:03d}"
 
 
-def load_electrodes_from_file(path: str) -> tuple[list[Electrode], str]:
+def intan_id_to_channel_id(intan_id: str, channels_per_port: int = INTAN_CHANNELS_PER_PORT) -> int:
     """
-    Load electrodes from JSON file.
+    Convert an INTAN ID into a probeinterface / SpikeInterface channel ID.
 
-    Supported formats:
-    1) probeinterface JSON (preferred)
-    2) legacy custom editor JSON
-
-    Args:
-        path: Path to JSON file.
-
-    Returns:
-        (models, si_units): list of Electrode and distance unit.
+    Accepted forms:
+    - integer string: "12" -> 12
+    - port-channel: "A-003", "A003", "D-018" -> port * channels_per_port + channel
+      (A=0 … Z=25; 32 channels per port by default)
+    - disconnected: "NC", "NC1", "NC3" -> -1
 
     Raises:
-        ValueError: unsupported format, missing dependency, or empty content.
+        ValueError: if the INTAN ID cannot be converted.
+    """
+    text = str(intan_id).strip()
+    if not text:
+        raise ValueError("INTAN ID is empty.")
+
+    if text.lstrip("-").isdigit():
+        return int(text)
+
+    nc_match = _INTAN_NC_RE.fullmatch(text)
+    if nc_match:
+        return -1
+
+    port_match = _INTAN_PORT_RE.fullmatch(text)
+    if port_match:
+        port = ord(port_match.group(1).upper()) - ord("A")
+        channel = int(port_match.group(2))
+        if channel < 0:
+            raise ValueError(f"Invalid INTAN channel in « {intan_id} ».")
+        return port * channels_per_port + channel
+
+    raise ValueError(
+        f"Cannot convert INTAN ID « {intan_id} » to a channel ID. "
+        "Use an integer, a port-channel like A-003, or NC for disconnected."
+    )
+
+
+def _extra_from_electrode_dict(el: dict[str, Any]) -> dict[str, Any]:
+    """Collect file-defined extra attributes from nested or inline keys."""
+    extra: dict[str, Any] = {}
+    nested = el.get("attributes", el.get("extra"))
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            key_text = str(key).strip()
+            if key_text and key_text not in _ELECTRODE_KNOWN_KEYS and key_text not in BUILTIN_ATTRIBUTE_KEYS:
+                extra[key_text] = value
+    for key, value in el.items():
+        key_text = str(key).strip()
+        if key_text in _ELECTRODE_KNOWN_KEYS or key_text in BUILTIN_ATTRIBUTE_KEYS:
+            continue
+        extra[key_text] = value
+    return extra
+
+
+def _electrode_from_native_dict(el: dict[str, Any], fallback_index: int) -> Electrode:
+    """Build an Electrode from a native or legacy custom JSON object."""
+    eid = _as_int(el.get("eid"), fallback_index)
+    potentiostat_id = el.get("potentiostat_id", el.get("channel_index", fallback_index))
+    intan_id = el.get("intan_id", el.get("contact_id", DEFAULT_INTAN_ID))
+    manufacturer_id = el.get("manufacturer_id", DEFAULT_MANUFACTURER_ID)
+    radius = max(_as_float(el.get("radius"), DEFAULT_RADIUS), MIN_RADIUS)
+    height = max(_as_float(el.get("height"), 0.0), 0.0)
+    shape = normalize_contact_shape(_as_str(el.get("shape"), DEFAULT_SHAPE), DEFAULT_SHAPE)
+    return Electrode(
+        eid=eid,
+        x=_as_float(el.get("x"), 0.0),
+        y=_as_float(el.get("y"), 0.0),
+        radius=radius,
+        height=height,
+        enabled=bool(el.get("enabled", True)),
+        potentiostat_id=_as_int(potentiostat_id, fallback_index),
+        intan_id=_as_str(intan_id, DEFAULT_INTAN_ID),
+        manufacturer_id=_as_str(manufacturer_id, DEFAULT_MANUFACTURER_ID),
+        contact_plane_axis=_parse_contact_plane_axis(el.get("contact_plane_axis")),
+        shank_id=_as_str(el.get("shank_id"), ""),
+        shape=shape,
+        extra=_extra_from_electrode_dict(el),
+    )
+
+
+def _load_native_or_legacy_custom(
+    data: dict[str, Any],
+) -> tuple[list[Electrode], str, list[AttributeSpec]]:
+    raw_list = data.get("electrodes")
+    if not isinstance(raw_list, list):
+        raise ValueError("No electrodes found in file.")
+    si_units = str(data.get("si_units", DEFAULT_UNITS) or DEFAULT_UNITS)
+    models: list[Electrode] = []
+    for i, el in enumerate(raw_list):
+        if not isinstance(el, dict):
+            continue
+        models.append(_electrode_from_native_dict(el, i))
+    if not models:
+        raise ValueError("No electrodes found in file.")
+    schema = schema_from_payload(data.get("electrode_attributes"), models)
+    fill_electrodes_extras(models, schema, prune=False)
+    return models, si_units, schema
+
+
+def _plane_axis_from_probe_entry(axes_entry: Any) -> tuple[float, float, float, float]:
+    """
+    probeinterface stores plane axes as [[x0, x1], [y0, y1]].
+    """
+    if not isinstance(axes_entry, (list, tuple)) or len(axes_entry) != 2:
+        return DEFAULT_PLANE_AXIS
+    row_x, row_y = axes_entry
+    if not isinstance(row_x, (list, tuple)) or len(row_x) != 2:
+        return DEFAULT_PLANE_AXIS
+    if not isinstance(row_y, (list, tuple)) or len(row_y) != 2:
+        return DEFAULT_PLANE_AXIS
+    try:
+        return (float(row_x[0]), float(row_x[1]), float(row_y[0]), float(row_y[1]))
+    except (TypeError, ValueError):
+        return DEFAULT_PLANE_AXIS
+
+
+def _extents_from_probe_shape(shape: str, params: Any) -> tuple[float, float]:
+    return extents_from_probe_params(shape, params, DEFAULT_RADIUS, MIN_RADIUS)
+
+
+def _load_probeinterface(data: dict[str, Any]) -> tuple[list[Electrode], str]:
+    """
+    Load a probeinterface JSON without importing probeinterface.
+
+    Default mapping (plain probeinterface files):
+    - device_channel_indices -> potentiostat_id
+    - contact_ids -> intan_id
+    - manufacturer_id left empty
+
+    Files exported by this editor also store native fields in
+    `contact_annotations`; those override the default mapping when present.
+    Extra annotation keys become electrode extra attributes.
+    Pads are not part of probeinterface and are not restored here.
+    """
+    probes = data.get("probes")
+    if not isinstance(probes, list) or not probes:
+        raise ValueError("No probes found in probeinterface file.")
+
+    models: list[Electrode] = []
+    si_units = DEFAULT_UNITS
+    fallback_eid = 0
+    for probe in probes:
+        if not isinstance(probe, dict):
+            continue
+        si_units = str(probe.get("si_units", si_units) or si_units)
+        positions = probe.get("contact_positions") or []
+        if not isinstance(positions, list):
+            continue
+        n = len(positions)
+        plane_axes = probe.get("contact_plane_axes") or []
+        shapes = probe.get("contact_shapes") or []
+        shape_params = probe.get("contact_shape_params") or []
+        device_channels = probe.get("device_channel_indices")
+        contact_ids = probe.get("contact_ids")
+        shank_ids = probe.get("shank_ids")
+        annotations = probe.get("contact_annotations")
+
+        for i in range(n):
+            pos = positions[i]
+            if not isinstance(pos, (list, tuple)) or len(pos) < 2:
+                continue
+            x = _as_float(pos[0], 0.0)
+            y = _as_float(pos[1], 0.0)
+            shape = DEFAULT_SHAPE
+            if isinstance(shapes, list) and i < len(shapes):
+                shape = normalize_contact_shape(
+                    _as_str(shapes[i], DEFAULT_SHAPE),
+                    DEFAULT_SHAPE,
+                )
+            params = shape_params[i] if isinstance(shape_params, list) and i < len(shape_params) else {}
+            radius, height = _extents_from_probe_shape(shape, params)
+            plane = DEFAULT_PLANE_AXIS
+            if isinstance(plane_axes, list) and i < len(plane_axes):
+                plane = _plane_axis_from_probe_entry(plane_axes[i])
+
+            eid = fallback_eid
+            eid_ann = _annotation_at(annotations, "eid", i)
+            if eid_ann is not None:
+                eid = _as_int(eid_ann, fallback_eid)
+
+            potentiostat_id = eid
+            if isinstance(device_channels, list) and i < len(device_channels) and device_channels[i] is not None:
+                potentiostat_id = _as_int(device_channels[i], eid)
+            pot_ann = _annotation_at(annotations, "potentiostat_id", i)
+            if pot_ann is not None:
+                potentiostat_id = _as_int(pot_ann, potentiostat_id)
+
+            intan_id = DEFAULT_INTAN_ID
+            if isinstance(contact_ids, list) and i < len(contact_ids) and contact_ids[i] is not None:
+                intan_id = _as_str(contact_ids[i], DEFAULT_INTAN_ID)
+            intan_ann = _annotation_at(annotations, "intan_id", i)
+            if intan_ann is not None:
+                intan_id = _as_str(intan_ann, intan_id)
+
+            manufacturer_id = DEFAULT_MANUFACTURER_ID
+            man_ann = _annotation_at(annotations, "manufacturer_id", i)
+            if man_ann is not None:
+                manufacturer_id = _as_str(man_ann, DEFAULT_MANUFACTURER_ID)
+
+            shank_id = ""
+            if isinstance(shank_ids, list) and i < len(shank_ids) and shank_ids[i] is not None:
+                shank_id = _as_str(shank_ids[i], "")
+            shank_ann = _annotation_at(annotations, "shank_id", i)
+            if shank_ann is not None:
+                shank_id = _as_str(shank_ann, shank_id)
+
+            extra: dict[str, Any] = {}
+            if isinstance(annotations, dict):
+                for key, values in annotations.items():
+                    key_text = str(key).strip()
+                    if (
+                        not key_text
+                        or key_text in NATIVE_CONTACT_ANNOTATION_KEYS
+                        or key_text in BUILTIN_ATTRIBUTE_KEYS
+                        or key_text in _ELECTRODE_KNOWN_KEYS
+                    ):
+                        continue
+                    extra[key_text] = _annotation_at(annotations, key_text, i)
+
+            models.append(
+                Electrode(
+                    eid=eid,
+                    x=x,
+                    y=y,
+                    radius=radius,
+                    height=height,
+                    enabled=True,
+                    potentiostat_id=potentiostat_id,
+                    intan_id=intan_id,
+                    manufacturer_id=manufacturer_id,
+                    contact_plane_axis=plane,
+                    shank_id=shank_id,
+                    shape=shape,
+                    extra=extra,
+                )
+            )
+            fallback_eid = max(fallback_eid, eid) + 1
+
+    if not models:
+        raise ValueError("No contacts found in probeinterface file.")
+    return models, si_units
+
+
+def _pad_from_native_dict(raw: dict[str, Any], fallback_index: int) -> Pad:
+    """Build a Pad from a native JSON object."""
+    pid = _as_int(raw.get("pid"), fallback_index)
+    electrode_eid = _as_int(raw.get("electrode_eid"), -1)
+    radius = max(_as_float(raw.get("radius"), DEFAULT_PAD_RADIUS), MIN_RADIUS)
+    height = max(_as_float(raw.get("height"), 0.0), 0.0)
+    shape = normalize_contact_shape(_as_str(raw.get("shape"), DEFAULT_PAD_SHAPE), DEFAULT_PAD_SHAPE)
+    return Pad(
+        pid=pid,
+        electrode_eid=electrode_eid,
+        x=_as_float(raw.get("x"), 0.0),
+        y=_as_float(raw.get("y"), 0.0),
+        radius=radius,
+        height=height,
+        enabled=bool(raw.get("enabled", True)),
+        interface_id=_as_str(raw.get("interface_id"), DEFAULT_INTERFACE_ID),
+        system_id=_as_str(raw.get("system_id"), DEFAULT_SYSTEM_ID),
+        shape=shape,
+    )
+
+
+def _load_pads_from_payload(data: dict[str, Any]) -> list[Pad]:
+    """Load pads from native JSON. Missing or invalid lists yield an empty list."""
+    raw_list = data.get("pads")
+    if not isinstance(raw_list, list):
+        return []
+    pads: list[Pad] = []
+    for i, raw in enumerate(raw_list):
+        if not isinstance(raw, dict):
+            continue
+        pads.append(_pad_from_native_dict(raw, i))
+    return pads
+
+
+def load_array_from_file(path: str) -> tuple[list[Electrode], list[Pad], str, list[AttributeSpec]]:
+    """
+    Load electrodes, pads and the electrode-attribute schema from a JSON file.
+
+    Supported formats:
+    1) mea_editor native JSON (pads optional, absent on older files)
+    2) legacy custom editor JSON
+    3) probeinterface JSON (read without the probeinterface package)
+
+    Returns:
+        (electrodes, pads, si_units, electrode_attributes)
+
+    Raises:
+        ValueError: unsupported format or empty content.
+        OSError / json.JSONDecodeError: file errors (propagated).
     """
     with open(path, "r", encoding="utf-8") as fh:
         data = json.load(fh)
 
-    # Format 1: probeinterface JSON (official parser).
-    if (
-        isinstance(data, dict)
-        and data.get("specification") == "probeinterface"
-        and isinstance(data.get("probes"), list)
-        and data["probes"]
-    ):
-        try:
-            import probeinterface as ProbeI
-        except Exception as exc:
-            raise ValueError("probeinterface is required to read probeinterface JSON files.") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Unsupported file format.")
 
-        # Official parser to stay robust to format evolution.
-        probe = ProbeI.read_probeinterface(path)
-        df = probe.to_dataframe(complete=True)
-        si_units = str(getattr(probe, "si_units", DEFAULT_UNITS) or DEFAULT_UNITS)
-
-        models: list[Electrode] = []
-        for i, row in df.reset_index(drop=True).iterrows():
-            # i = row index; row = Series with columns x, y, radius, etc.
-            shape = DEFAULT_SHAPE
-            radius = DEFAULT_RADIUS
-            # Use radius only when column exists and value is valid.
-            if "radius" in row and _is_valid_value(row["radius"]):
-                radius = float(row["radius"])
-            elif "width" in row or "height" in row:
-                # Backward compatibility for files that carried square dimensions.
-                width = float(row["width"]) if "width" in row and _is_valid_value(row["width"]) else 24.0
-                height = float(row["height"]) if "height" in row and _is_valid_value(row["height"]) else 24.0
-                radius = max(width, height) / 2.0
-
-            channel_index = i
-            if "device_channel_indices" in row and _is_valid_value(row["device_channel_indices"]):
-                channel_index = int(row["device_channel_indices"])
-
-            contact_id = DEFAULT_CONTACT_ID
-            if "contact_ids" in row and _is_valid_value(row["contact_ids"]):
-                contact_id = str(row["contact_ids"])
-
-            shank_id = ""
-            if "shank_ids" in row and _is_valid_value(row["shank_ids"]):
-                shank_id = str(row["shank_ids"])
-
-            plane_axis_x_0, plane_axis_x_1, plane_axis_y_0, plane_axis_y_1 = DEFAULT_PLANE_AXIS
-            if "plane_axis_x_0" in row and _is_valid_value(row["plane_axis_x_0"]):
-                plane_axis_x_0 = float(row["plane_axis_x_0"])
-            if "plane_axis_x_1" in row and _is_valid_value(row["plane_axis_x_1"]):
-                plane_axis_x_1 = float(row["plane_axis_x_1"])
-            if "plane_axis_y_0" in row and _is_valid_value(row["plane_axis_y_0"]):
-                plane_axis_y_0 = float(row["plane_axis_y_0"])
-            if "plane_axis_y_1" in row and _is_valid_value(row["plane_axis_y_1"]):
-                plane_axis_y_1 = float(row["plane_axis_y_1"])
-
-            models.append(
-                Electrode(
-                    eid=i,
-                    x=float(row["x"]),
-                    y=float(row["y"]),
-                    radius=max(radius, MIN_RADIUS),
-                    enabled=True,
-                    channel_index=channel_index,
-                    contact_id=contact_id,
-                    contact_plane_axis=(plane_axis_x_0, plane_axis_x_1, plane_axis_y_0, plane_axis_y_1),
-                    shank_id=shank_id,
-                    shape=shape,
-                )
-            )
-
-        if not models:
-            raise ValueError("No contacts found in probeinterface file.")
-        return models, si_units
-
-    # Format 2: legacy editor custom JSON.
-    if isinstance(data, dict) and isinstance(data.get("electrodes"), list):
-        si_units = str(data.get("si_units", DEFAULT_UNITS))
-        models: list[Electrode] = []
-        for i, el in enumerate(data["electrodes"]):
-            if not isinstance(el, dict):
-                continue
-            models.append(
-                Electrode(
-                    eid=int(el.get("eid", i)),
-                    x=float(el.get("x", 0.0)),
-                    y=float(el.get("y", 0.0)),
-                    radius=max(float(el.get("radius", DEFAULT_RADIUS)), MIN_RADIUS),
-                    enabled=bool(el.get("enabled", True)),
-                    channel_index=int(el.get("channel_index", i)),
-                    contact_id=str(el.get("contact_id", DEFAULT_CONTACT_ID)),
-                    contact_plane_axis=_parse_contact_plane_axis(el.get("contact_plane_axis")),
-                    shank_id=str(el.get("shank_id", "")),
-                    shape=DEFAULT_SHAPE,
-                )
-            )
-        if not models:
-            raise ValueError("No electrodes found in custom file.")
-        return models, si_units
+    spec = data.get("specification")
+    if spec == PROBEINTERFACE_SPEC:
+        models, units = _load_probeinterface(data)
+        schema = schema_from_payload(None, models)
+        fill_electrodes_extras(models, schema, prune=False)
+        return models, [], units, schema
+    if spec == NATIVE_SPECIFICATION or isinstance(data.get("electrodes"), list):
+        models, units, schema = _load_native_or_legacy_custom(data)
+        return models, _load_pads_from_payload(data), units, schema
 
     raise ValueError("Unsupported file format.")
 
 
-def save_electrodes_to_file(path: str, electrodes: list[Electrode], si_units: str) -> None:
+def load_electrodes_from_file(path: str) -> tuple[list[Electrode], str]:
     """
-    Save electrodes in probeinterface JSON format.
+    Load electrodes from a JSON file.
 
-    This function intentionally enforces probeinterface writing so saved files
-    are consumable by downstream programs using `ProbeI.read_probeinterface`.
+    Supported formats:
+    1) mea_editor native JSON
+    2) legacy custom editor JSON
+    3) probeinterface JSON (read without the probeinterface package)
+
+    Returns:
+        (models, si_units)
+
+    Raises:
+        ValueError: unsupported format or empty content.
+        OSError / json.JSONDecodeError: file errors (propagated).
     """
+    models, _pads, units, _schema = load_array_from_file(path)
+    return models, units
+
+
+def is_probeinterface_file(path: str) -> bool:
+    """True if the JSON file is a probeinterface document."""
     try:
-        import probeinterface as ProbeI
-    except Exception as exc:
-        raise ValueError("probeinterface is required to save array files.") from exc
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return isinstance(data, dict) and data.get("specification") == PROBEINTERFACE_SPEC
 
-    # probeinterface expects contacts in deterministic order.
-    # Sort by eid for deterministic order.
+
+def _electrode_to_native_dict(model: Electrode, schema: list[AttributeSpec] | None = None) -> dict[str, Any]:
+    payload = {
+        "eid": int(model.eid),
+        "x": float(model.x),
+        "y": float(model.y),
+        "radius": max(float(model.radius), MIN_RADIUS),
+        "height": max(float(model.height), 0.0),
+        "enabled": bool(model.enabled),
+        "potentiostat_id": int(model.potentiostat_id),
+        "intan_id": str(model.intan_id),
+        "manufacturer_id": str(model.manufacturer_id),
+        "contact_plane_axis": [float(v) for v in model.contact_plane_axis],
+        "shank_id": str(model.shank_id),
+        "shape": str(model.shape or DEFAULT_SHAPE),
+    }
+    extras = extra_specs(schema) if schema is not None else []
+    attributes: dict[str, Any] = {}
+    if extras:
+        for spec in extras:
+            raw = model.extra.get(spec.key, spec.default)
+            attributes[spec.key] = coerce_value(spec.value_type, raw, spec.default)
+    elif model.extra:
+        attributes = dict(model.extra)
+    if attributes:
+        payload["attributes"] = attributes
+    return payload
+
+
+def _pad_to_native_dict(model: Pad) -> dict[str, Any]:
+    return {
+        "pid": int(model.pid),
+        "electrode_eid": int(model.electrode_eid),
+        "x": float(model.x),
+        "y": float(model.y),
+        "radius": max(float(model.radius), MIN_RADIUS),
+        "height": max(float(model.height), 0.0),
+        "enabled": bool(model.enabled),
+        "interface_id": str(model.interface_id),
+        "system_id": str(model.system_id),
+        "shape": str(model.shape or DEFAULT_PAD_SHAPE),
+    }
+
+
+def save_electrodes_to_file(
+    path: str,
+    electrodes: list[Electrode],
+    si_units: str,
+    pads: list[Pad] | None = None,
+    electrode_attributes: list[AttributeSpec] | None = None,
+) -> None:
+    """
+    Save electrodes (and optional pads) in native mea_editor JSON format.
+
+    Extra electrode attributes and their schema are stored in the file so the
+    editor can rebuild the same fields when the file is opened again.
+    Pads, contact shapes, and geometry (including rect height) are persisted.
+    """
+    schema = list(electrode_attributes) if electrode_attributes is not None else schema_from_payload(None, electrodes)
+    fill_electrodes_extras(electrodes, schema, prune=False)
     ordered = sorted(electrodes, key=lambda m: m.eid)
-    positions = np.array([[m.x, m.y] for m in ordered], dtype=float)
-    shapes = ["circle" for _ in ordered]
-    # shape_params: radius per contact, minimum MIN_RADIUS.
-    shape_params = [{"radius": max(float(m.radius), MIN_RADIUS)} for m in ordered]
-    plane_axes = np.array(
-        [
+    ordered_pads = sorted(pads or [], key=lambda m: m.pid)
+    payload = {
+        "specification": NATIVE_SPECIFICATION,
+        "version": NATIVE_VERSION,
+        "editor_version": EDITOR_VERSION,
+        "si_units": si_units or DEFAULT_UNITS,
+        "electrode_attributes": schema_to_payload(schema),
+        "electrodes": [_electrode_to_native_dict(m, schema) for m in ordered],
+        "pads": [_pad_to_native_dict(m) for m in ordered_pads],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=4)
+        fh.write("\n")
+
+
+save_array_to_file = save_electrodes_to_file
+
+
+def _contact_ids_for_spikeinterface(electrodes: list[Electrode]) -> list[str]:
+    """
+    Build unique Contact IDs for probeinterface.
+
+    Prefer Manufacturer ID when every electrode has one; otherwise INTAN ID.
+    """
+    manufacturer_ids = [str(m.manufacturer_id).strip() for m in electrodes]
+    if all(manufacturer_ids):
+        return manufacturer_ids
+    if any(manufacturer_ids):
+        missing = [m.eid for m, mid in zip(electrodes, manufacturer_ids) if not mid]
+        raise ValueError(
+            "Manufacturer ID must be filled on every electrode (or left empty on all) "
+            f"before SpikeInterface export. Missing on eid: {missing}."
+        )
+    intan_ids = [str(m.intan_id).strip() for m in electrodes]
+    if any(not cid for cid in intan_ids):
+        missing = [m.eid for m, cid in zip(electrodes, intan_ids) if not cid]
+        raise ValueError(f"INTAN ID is empty on electrode eid: {missing}.")
+    return intan_ids
+
+
+def build_probeinterface_payload(
+    electrodes: list[Electrode],
+    si_units: str,
+    pads: list[Pad] | None = None,
+    electrode_attributes: list[AttributeSpec] | None = None,
+) -> dict[str, Any]:
+    """
+    Build a probeinterface JSON dict for SpikeInterface.
+
+    Channel ID  -> device_channel_indices (from INTAN ID)
+    Contact ID  -> contact_ids (from Manufacturer ID, fallback INTAN ID)
+
+    Native identifiers, extra attributes, and the first linked pad IDs are
+    stored in contact_annotations. Pads themselves are not exported as contacts.
+    """
+    if not electrodes:
+        raise ValueError("No electrodes to export.")
+
+    ordered = sorted(electrodes, key=lambda m: m.eid)
+    contact_ids = _contact_ids_for_spikeinterface(ordered)
+    unique_contacts = set(contact_ids)
+    if len(unique_contacts) != len(contact_ids):
+        raise ValueError(
+            "Contact IDs must be unique for SpikeInterface / probeinterface. "
+            "Fill unique Manufacturer IDs (or unique INTAN IDs if Manufacturer ID is unused)."
+        )
+
+    channel_ids: list[int] = []
+    errors: list[str] = []
+    for model in ordered:
+        try:
+            channel_ids.append(intan_id_to_channel_id(model.intan_id))
+        except ValueError as exc:
+            errors.append(f"eid {model.eid}: {exc}")
+    if errors:
+        raise ValueError("Could not derive channel IDs from INTAN IDs:\n" + "\n".join(errors))
+
+    duplicate_channels = sorted(
+        channel for channel, count in Counter(ch for ch in channel_ids if ch >= 0).items() if count > 1
+    )
+    if duplicate_channels:
+        raise ValueError(
+            "Channel IDs derived from INTAN ID must be unique (except NC / disconnected = -1). "
+            f"Duplicates: {duplicate_channels}."
+        )
+
+    schema = (
+        list(electrode_attributes)
+        if electrode_attributes is not None
+        else schema_from_payload(None, ordered)
+    )
+    fill_electrodes_extras(ordered, schema, prune=False)
+    pad_by_eid = _first_pad_by_electrode(pads)
+    contact_annotations: dict[str, list[Any]] = {
+        SI_CHANNEL_ID_KEY: channel_ids,
+        SI_CONTACT_ID_KEY: contact_ids,
+        "eid": [int(model.eid) for model in ordered],
+        "potentiostat_id": [int(model.potentiostat_id) for model in ordered],
+        "intan_id": [str(model.intan_id) for model in ordered],
+        "manufacturer_id": [str(model.manufacturer_id) for model in ordered],
+        "pad_interface_id": [
+            str(pad_by_eid[model.eid].interface_id) if model.eid in pad_by_eid else ""
+            for model in ordered
+        ],
+        "pad_system_id": [
+            str(pad_by_eid[model.eid].system_id) if model.eid in pad_by_eid else ""
+            for model in ordered
+        ],
+    }
+    for spec in extra_specs(schema):
+        contact_annotations[spec.key] = [
+            coerce_value(spec.value_type, model.extra.get(spec.key, spec.default), spec.default)
+            for model in ordered
+        ]
+
+    probe: dict[str, Any] = {
+        "ndim": 2,
+        "si_units": si_units_for_probeinterface(si_units),
+        "annotations": {
+            "name": "mea_editor",
+            "model_name": "mea_editor",
+            "manufacturer": "mea_editor",
+        },
+        "contact_annotations": contact_annotations,
+        "contact_positions": [[float(m.x), float(m.y)] for m in ordered],
+        "contact_plane_axes": [
             [
                 [float(m.contact_plane_axis[0]), float(m.contact_plane_axis[1])],
                 [float(m.contact_plane_axis[2]), float(m.contact_plane_axis[3])],
             ]
             for m in ordered
         ],
-        dtype=float,
-    )
+        "contact_shapes": [
+            normalize_contact_shape(str(m.shape or DEFAULT_SHAPE), DEFAULT_ELECTRODE_SHAPE)
+            for m in ordered
+        ],
+        "contact_shape_params": [
+            probe_shape_params(m.shape, m.radius, m.height, MIN_RADIUS) for m in ordered
+        ],
+        "device_channel_indices": channel_ids,
+        "contact_ids": contact_ids,
+        "shank_ids": [str(m.shank_id) for m in ordered],
+    }
+    return {
+        "specification": PROBEINTERFACE_SPEC,
+        "version": PROBEINTERFACE_VERSION,
+        "probes": [probe],
+    }
 
-    # Create 2D probe and assign contacts.
-    probe = ProbeI.Probe(ndim=2, si_units=(si_units or DEFAULT_UNITS))
-    probe.set_contacts(positions=positions, shapes=shapes, shape_params=shape_params, plane_axes=plane_axes)
-    device_channel_indices = np.array([int(m.channel_index) for m in ordered], dtype=int)
-    contact_ids = [str(m.contact_id) for m in ordered]
-    shank_ids = [str(m.shank_id) for m in ordered]
-    probe.set_device_channel_indices(device_channel_indices)
-    probe.set_contact_ids(contact_ids)
-    probe.set_shank_ids(shank_ids)
-    ProbeI.write_probeinterface(path, probe)
+
+def export_spikeinterface_json(
+    path: str,
+    electrodes: list[Electrode],
+    si_units: str,
+    pads: list[Pad] | None = None,
+    electrode_attributes: list[AttributeSpec] | None = None,
+) -> None:
+    """
+    Write a probeinterface JSON file usable by SpikeInterface.
+
+    The JSON contains:
+    - device_channel_indices: channel ID (from INTAN ID)
+    - contact_ids: Contact ID (from Manufacturer ID, fallback INTAN ID)
+    - contact_annotations: native IDs, extra attributes, linked pad IDs
+    """
+    payload = build_probeinterface_payload(
+        electrodes,
+        si_units,
+        pads=pads,
+        electrode_attributes=electrode_attributes,
+    )
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=4)
+        fh.write("\n")
+
+
+def _require_openpyxl_workbook():
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:
+        raise ImportError("openpyxl is required for XLSX export.") from exc
+    return Workbook
+
+
+def _resolved_schema(
+    electrodes: list[Electrode],
+    electrode_attributes: list[AttributeSpec] | None,
+) -> list[AttributeSpec]:
+    if electrode_attributes is not None:
+        schema = list(electrode_attributes)
+    else:
+        schema = schema_from_payload(None, electrodes)
+    fill_electrodes_extras(electrodes, schema, prune=False)
+    return schema
+
+
+def export_analysis_xlsx(
+    path: str,
+    electrodes: list[Electrode],
+    pads: list[Pad] | None = None,
+    electrode_attributes: list[AttributeSpec] | None = None,
+) -> None:
+    """
+    Write the analysis table used by downstream mapping scripts.
+
+    The first four columns stay stable:
+    - channel: Potentiostat ID
+    - row: electrode y
+    - col: electrode x
+    - shape: electrode shape
+
+    Extra identifiers, attributes, and the first linked pad follow.
+    """
+    if not electrodes:
+        raise ValueError("No electrodes to export.")
+    Workbook = _require_openpyxl_workbook()
+    schema = _resolved_schema(electrodes, electrode_attributes)
+    extras = extra_specs(schema)
+    pad_by_eid = _first_pad_by_electrode(pads)
+
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "array"
+    headers = [
+        "channel",
+        "row",
+        "col",
+        "shape",
+        "intan_id",
+        "manufacturer_id",
+        "shank_id",
+        "enabled",
+        *[spec.key for spec in extras],
+        "pad_interface_id",
+        "pad_system_id",
+    ]
+    worksheet.append(headers)
+    for model in sorted(electrodes, key=lambda item: (item.potentiostat_id, item.eid)):
+        pad = pad_by_eid.get(model.eid)
+        row = [
+            model.potentiostat_id,
+            model.y,
+            model.x,
+            model.shape,
+            model.intan_id,
+            model.manufacturer_id,
+            model.shank_id,
+            bool(model.enabled),
+        ]
+        row.extend(model.extra.get(spec.key, spec.default) for spec in extras)
+        row.extend(
+            [
+                pad.interface_id if pad is not None else "",
+                pad.system_id if pad is not None else "",
+            ]
+        )
+        worksheet.append(row)
+    workbook.save(path)
+    workbook.close()
+
+
+def export_array_xlsx(
+    path: str,
+    electrodes: list[Electrode],
+    pads: list[Pad] | None = None,
+    electrode_attributes: list[AttributeSpec] | None = None,
+    si_units: str = DEFAULT_UNITS,
+) -> None:
+    """
+    Write a full array workbook: electrodes sheet, pads sheet, schema sheet.
+
+    Existing electrode columns are kept; geometry and pad linkage are appended.
+    """
+    if not electrodes:
+        raise ValueError("No electrodes to export.")
+    Workbook = _require_openpyxl_workbook()
+    schema = _resolved_schema(electrodes, electrode_attributes)
+    extras = extra_specs(schema)
+    pad_by_eid = _first_pad_by_electrode(pads)
+    electrode_by_eid = {model.eid: model for model in electrodes}
+
+    workbook = Workbook()
+    electrodes_sheet = workbook.active
+    electrodes_sheet.title = "array"
+    electrode_headers = [
+        "eid",
+        "potentiostat_id",
+        "intan_id",
+        "manufacturer_id",
+        "row",
+        "col",
+        "shank_id",
+        "enabled",
+        "shape",
+        "radius",
+        "height",
+        "contact_plane_axis",
+        *[spec.key for spec in extras],
+        "pad_interface_id",
+        "pad_system_id",
+        "si_units",
+    ]
+    electrodes_sheet.append(electrode_headers)
+    for model in sorted(electrodes, key=lambda item: (item.potentiostat_id, item.eid)):
+        pad = pad_by_eid.get(model.eid)
+        row = [
+            int(model.eid),
+            model.potentiostat_id,
+            model.intan_id,
+            model.manufacturer_id,
+            model.y,
+            model.x,
+            model.shank_id,
+            bool(model.enabled),
+            model.shape,
+            float(model.radius),
+            float(model.height),
+            _contact_plane_axis_text(model.contact_plane_axis),
+        ]
+        row.extend(model.extra.get(spec.key, spec.default) for spec in extras)
+        row.extend(
+            [
+                pad.interface_id if pad is not None else "",
+                pad.system_id if pad is not None else "",
+                si_units or DEFAULT_UNITS,
+            ]
+        )
+        electrodes_sheet.append(row)
+
+    pads_sheet = workbook.create_sheet("pads")
+    pads_sheet.append(
+        [
+            "pid",
+            "electrode_eid",
+            "potentiostat_id",
+            "intan_id",
+            "manufacturer_id",
+            "shank_id",
+            "x",
+            "y",
+            "shape",
+            "radius",
+            "height",
+            "enabled",
+            "interface_id",
+            "system_id",
+        ]
+    )
+    for pad in sorted(pads or [], key=lambda item: item.pid):
+        electrode = electrode_by_eid.get(pad.electrode_eid)
+        pads_sheet.append(
+            [
+                int(pad.pid),
+                int(pad.electrode_eid),
+                electrode.potentiostat_id if electrode is not None else "",
+                electrode.intan_id if electrode is not None else "",
+                electrode.manufacturer_id if electrode is not None else "",
+                electrode.shank_id if electrode is not None else "",
+                float(pad.x),
+                float(pad.y),
+                pad.shape,
+                float(pad.radius),
+                float(pad.height),
+                bool(pad.enabled),
+                pad.interface_id,
+                pad.system_id,
+            ]
+        )
+
+    schema_sheet = workbook.create_sheet("electrode_attributes")
+    schema_sheet.append(["key", "label", "type", "default", "builtin", "unique", "unique_scope"])
+    for spec in schema:
+        schema_sheet.append(
+            [
+                spec.key,
+                spec.label,
+                spec.value_type,
+                spec.default,
+                bool(spec.builtin),
+                bool(spec.unique),
+                spec.unique_scope,
+            ]
+        )
+    workbook.save(path)
+    workbook.close()

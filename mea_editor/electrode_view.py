@@ -2,9 +2,9 @@
 Interactive graphics item bound to one Electrode model.
 
 It owns:
-- circular shape path,
-- center label (channel_index),
-- bottom label (contact_id).
+- contact shape path (circle, square, or rect),
+- center label (potentiostat ID, with optional shank prefix),
+- bottom label (INTAN ID).
 """
 
 from __future__ import annotations
@@ -16,7 +16,8 @@ try:
 except ImportError as exc:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from exc
 
-from .electrode import Electrode
+from .contact_shape import contact_half_extents, contact_path_box
+from .electrode import DEFAULT_PLANE_AXIS, Electrode
 
 
 class ElectrodeView(QGraphicsPathItem):
@@ -24,9 +25,9 @@ class ElectrodeView(QGraphicsPathItem):
     Interactive graphics item bound to one `Electrode` model.
 
     It owns:
-    - circular shape path,
-    - center label (`channel_index`),
-    - bottom label (`contact_id`).
+    - contact shape path (circle, square, or rect),
+    - center label (potentiostat ID),
+    - bottom label (INTAN ID).
     """
 
     def __init__(self, model: Electrode, on_change, on_selection_change) -> None:
@@ -49,7 +50,7 @@ class ElectrodeView(QGraphicsPathItem):
         self.label.setFont(label_font)
         self.label.setTransform(QTransform.fromScale(1.0, 1.0))  # Readable in Cartesian Y.
         self.label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
-        self.contact_label = QGraphicsSimpleTextItem(str(model.contact_id), self)
+        self.contact_label = QGraphicsSimpleTextItem(str(model.intan_id), self)
         self.contact_label.setBrush(QBrush(QColor("#d3dbe4")))
         self.contact_label.setFont(label_font)
         self.contact_label.setTransform(QTransform.fromScale(1.0, 1.0))
@@ -64,23 +65,11 @@ class ElectrodeView(QGraphicsPathItem):
         """
         Sync label text from model and reposition labels.
 
-        Updates channel_index (center) and contact_id (below circle).
+        Updates potentiostat ID (center) and INTAN ID (below contact).
         """
-        self.label.setText(self._channel_label_text())
-        self.contact_label.setText(str(self.model.contact_id))
+        self.label.setText(self.model.map_center_label())
+        self.contact_label.setText(str(self.model.intan_id))
         self._layout_labels()
-
-    def _channel_label_text(self) -> str:
-        """
-        Build center label text using shank and channel index.
-
-        Format:
-        - with shank: "<shank>-<channel 3 digits>" (example: "1-002")
-        - without shank: "<channel 3 digits>"
-        """
-        channel = f"{int(self.model.channel_index):03d}"
-        shank = str(self.model.shank_id).strip()
-        return f"{shank}-{channel}" if shank else channel
 
     def _color_for_shank(self) -> QColor:
         """
@@ -123,6 +112,8 @@ class ElectrodeView(QGraphicsPathItem):
         scene = self.scene()
         if scene is None:
             return 1.0
+        if hasattr(scene, "view_scale"):
+            return scene.view_scale(getattr(scene, "electrode_map_view", None))
         views = scene.views()
         if not views:
             return 1.0
@@ -132,34 +123,48 @@ class ElectrodeView(QGraphicsPathItem):
 
     def _layout_labels(self) -> None:
         """
-        Position labels: channel_index at center, contact_id below circle.
+        Position labels: potentiostat ID at center, INTAN ID below the contact.
 
         With ItemIgnoresTransformations, label bounding rects are in pixels;
         we convert to scene units using the view scale for correct placement.
         """
         scale = self._view_scale()
-        # Channel index centered inside electrode (item coords: center at origin).
+        # Potentiostat ID centered inside electrode (item coords: center at origin).
         br = self.label.boundingRect()
         # Convert pixel dimensions to scene units: scene = pixels / scale
         label_w, label_h = br.width() / scale, br.height() / scale
         self.label.setPos(-label_w / 2, label_h / 2)
-        # contact_id displayed below each electrode with small gap.
+        # INTAN ID displayed below each electrode with small gap.
         cbr = self.contact_label.boundingRect()
         contact_h = cbr.height() / scale
-        y_offset = self.model.radius + contact_h + 4.0
+        _half_x, half_y = contact_half_extents(self.model.shape, self.model.radius, self.model.height)
+        y_offset = half_y + contact_h + 4.0
         contact_w = cbr.width() / scale
         self.contact_label.setPos(-contact_w / 2, y_offset)
 
     def set_radius(self, radius: float) -> None:
-        """
-        Update model radius and path geometry (ellipse).
-        """
+        """Update model radius and rebuild the contact path."""
         self.model.radius = radius
+        self._update_path()
+
+    def set_height(self, height: float) -> None:
+        """Update model height and rebuild the contact path."""
+        self.model.height = height
+        self._update_path()
+
+    def _update_path(self) -> None:
+        """Rebuild path geometry from shape, radius, height, and plane axes."""
+        kind, x, y, w, h = contact_path_box(self.model.shape, self.model.radius, self.model.height)
         path = QPainterPath()
-        # Ellipse centered at item origin (0,0).
-        path.addEllipse(-radius, -radius, 2 * radius, 2 * radius)
+        if kind == "ellipse":
+            path.addEllipse(x, y, w, h)
+        else:
+            path.addRect(x, y, w, h)
+        plane = self.model.contact_plane_axis
+        if self.model.shape != "circle" and plane != DEFAULT_PLANE_AXIS:
+            x0, x1, y0, y1 = plane
+            path = QTransform(x0, x1, y0, y1, 0.0, 0.0).map(path)
         self.setPath(path)
-        # Guard: labels may not exist during early init.
         if hasattr(self, "label") and hasattr(self, "contact_label"):
             self._layout_labels()
 
@@ -170,7 +175,7 @@ class ElectrodeView(QGraphicsPathItem):
         Priority: duplicate (red) > selected (yellow) > enabled (color by shank) > disabled (gray).
         """
         # Duplicate state overrides selection and enabled for visibility.
-        is_duplicate = self.model.has_channel_duplicate or self.model.has_contact_duplicate
+        is_duplicate = self.model.has_any_duplicate()
         if is_duplicate:
             fill = QColor("#d44b4b")
             outline = QColor("#ffe0e0")
@@ -207,7 +212,7 @@ class ElectrodeView(QGraphicsPathItem):
         """
         Apply model state to visual item.
 
-        Updates: position, radius, label text, colors.
+        Updates: position, geometry, label text, colors.
         """
         self.setPos(self.model.x, self.model.y)
         self.set_radius(self.model.radius)
