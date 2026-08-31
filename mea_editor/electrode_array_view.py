@@ -11,10 +11,20 @@ from __future__ import annotations
 
 try:
     from PySide6.QtCore import QPointF, QRectF, Qt
-    from PySide6.QtGui import QColor, QPainter, QPen
-    from PySide6.QtWidgets import QFrame, QGraphicsScene, QGraphicsView
+    from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QTransform
+    from PySide6.QtWidgets import (
+        QFrame,
+        QGraphicsItem,
+        QGraphicsScene,
+        QGraphicsSimpleTextItem,
+        QGraphicsView,
+        QStyle,
+        QStyleOptionGraphicsItem,
+    )
 except ImportError as exc:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from exc
+
+from .contact_shape import contact_half_extents
 
 # Overlay axis band dimensions (in viewport pixels).
 AXIS_BAND_HEIGHT = 24
@@ -22,7 +32,142 @@ AXIS_BAND_WIDTH = 52
 # Min pixel distance between axis tick labels to avoid overlap.
 GRID_MIN_LABEL_SPACING_PX = 44
 # Keep contact labels inside the plot area when fitting.
-FIT_LABEL_MARGIN_PX = 28.0
+FIT_LABEL_MARGIN_PX = 42.0
+ZOOM_MIN_SCALE = 0.02
+ZOOM_MAX_SCALE = 80.0
+MAP_VIEW_ATTRS = ("electrode_map_view", "pad_map_view")
+
+
+def _option_without_qt_selection(option):
+    """Copy a paint option without Qt's default selection overlay.
+
+    QGraphicsPathItem / QGraphicsSimpleTextItem otherwise draw a dashed
+    rectangle around exposedRect. With ItemIgnoresTransformations labels
+    or a rubber-band update region, that rect can cover a whole column
+    and show up as a white bar on the dark canvas.
+    """
+    opt = QStyleOptionGraphicsItem(option)
+    opt.state &= ~QStyle.State_Selected
+    return opt
+
+
+class ViewScopedTextItem(QGraphicsSimpleTextItem):
+    """
+    Contact label that paints in only one mapping view.
+
+    Electrodes and pads share one scene shown by two cameras. Labels use
+    ItemIgnoresTransformations, so screen size is correct for a single zoom.
+    Each contact keeps one copy per camera; this item paints only in its home
+    view so the other camera can keep an independently positioned copy.
+    """
+
+    def __init__(self, text: str = "", parent=None, view_attr: str = "") -> None:
+        super().__init__(text, parent)
+        self._view_attr = view_attr
+        self.setAcceptedMouseButtons(Qt.NoButton)
+
+    def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
+        if widget is not None and not self._is_home_viewport(widget):
+            return
+        super().paint(painter, _option_without_qt_selection(option), widget)
+
+    def _is_home_viewport(self, widget) -> bool:
+        scene = self.scene()
+        if scene is None or not self._view_attr:
+            return True
+        view = getattr(scene, self._view_attr, None)
+        if view is None:
+            return True
+        viewport = view.viewport()
+        current = widget
+        while current is not None:
+            if current is view or current is viewport:
+                return True
+            current = current.parentWidget()
+        return False
+
+
+def _make_scoped_label(parent, view_attr: str, font: QFont, color: str) -> ViewScopedTextItem:
+    item = ViewScopedTextItem("", parent, view_attr)
+    item.setBrush(QBrush(QColor(color)))
+    item.setFont(font)
+    item.setTransform(QTransform.fromScale(1.0, 1.0))
+    item.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+    return item
+
+
+class ViewLabelPair:
+    """Center + below labels laid out for one mapping camera."""
+
+    def __init__(self, parent, view_attr: str, font: QFont) -> None:
+        self.view_attr = view_attr
+        self.center = _make_scoped_label(parent, view_attr, font, "#e9edf2")
+        self.below = _make_scoped_label(parent, view_attr, font, "#ffffff")
+
+    def set_text(self, center: str, below: str) -> None:
+        self.center.setText(center)
+        self.below.setText(below)
+        self.center.setVisible(bool(center))
+        self.below.setVisible(bool(below))
+
+    def set_brushes(self, center: QBrush, below: QBrush) -> None:
+        self.center.setBrush(center)
+        self.below.setBrush(below)
+
+    def layout(self, scale: float, half_y: float) -> None:
+        br = self.center.boundingRect()
+        label_w, label_h = br.width() / scale, br.height() / scale
+        self.center.setPos(-label_w / 2, label_h / 2)
+        cbr = self.below.boundingRect()
+        contact_h = cbr.height() / scale
+        y_offset = half_y + contact_h + 4.0
+        contact_w = cbr.width() / scale
+        self.below.setPos(-contact_w / 2, y_offset)
+
+
+class PerViewContactLabels:
+    """
+    Two label copies per contact, one per mapping camera.
+
+    Zooming one view only relayouts that view's copies, so text in the other
+    view stays put.
+    """
+
+    def _init_view_labels(self) -> None:
+        font = QFont()
+        font.setPointSize(9)
+        self._view_labels = [ViewLabelPair(self, attr, font) for attr in MAP_VIEW_ATTRS]
+        self.label = self._view_labels[0].center
+        self.contact_label = self._view_labels[0].below
+
+    def _set_label_text(self, center: str, below: str) -> None:
+        for pair in self._view_labels:
+            pair.set_text(center, below)
+
+    def _view_scale(self, view_attr: str) -> float:
+        scene = self.scene()
+        if scene is None:
+            return 1.0
+        if hasattr(scene, "view_scale"):
+            return scene.view_scale(getattr(scene, view_attr, None))
+        views = scene.views()
+        if not views:
+            return 1.0
+        t = views[0].transform()
+        scale = abs(t.m11()) if t.m11() != 0 else 1.0
+        return max(scale, 1e-6)
+
+    def _layout_labels(self, view_attr: str | None = None) -> None:
+        _half_x, half_y = contact_half_extents(
+            self.model.shape, self.model.radius, self.model.height
+        )
+        for pair in self._view_labels:
+            if view_attr is not None and pair.view_attr != view_attr:
+                continue
+            pair.layout(self._view_scale(pair.view_attr), half_y)
+
+    def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
+        super().paint(painter, _option_without_qt_selection(option), widget)
 
 
 class ElectrodeArrayView(QGraphicsView):
@@ -50,8 +195,8 @@ class ElectrodeArrayView(QGraphicsView):
         self.setAlignment(Qt.AlignCenter)
         # Rubber-band drag enables box selection on empty area.
         self.setDragMode(QGraphicsView.RubberBandDrag)
-        # Limit repaint to changed regions for better performance.
-        self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
+        # Full redraw avoids leftover rubber-band edges and overlay artifacts.
+        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
         self.setBackgroundBrush(QColor("#11151a"))
         # Cartesian orientation for scene coordinates: Y grows upward.
         # Qt view Y is naturally downward; scale(1,-1) flips it.
@@ -60,28 +205,13 @@ class ElectrodeArrayView(QGraphicsView):
         # stable so fit/center is not shifted by a late scrollbar.
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self._interaction_begin = lambda: None
-        self._interaction_end = lambda: None
         self._is_add_mode = lambda: False
         self._add_at = lambda x, y: None
         self._on_delete = lambda: None
-        self._on_view_transform_changed = lambda: None
+        self._on_view_transform_changed = lambda view=None: None
         self._on_activated = lambda: None
         self._is_middle_panning = False
         self._last_pan_pos = None
-
-    def set_interaction_callbacks(self, on_begin, on_end) -> None:
-        """
-        Register callbacks for the start and end of a drag interaction.
-
-        These callbacks capture state before/after a move for undo/redo.
-
-        Args:
-            on_begin: Function called on mousePress (capture snapshot).
-            on_end: Function called on mouseRelease (commit if changed).
-        """
-        self._interaction_begin = on_begin
-        self._interaction_end = on_end
 
     def set_add_callbacks(self, is_add_mode, add_at) -> None:
         """
@@ -109,6 +239,25 @@ class ElectrodeArrayView(QGraphicsView):
     def set_activated_callback(self, on_activated) -> None:
         """Register callback when this viewport is clicked or zoomed."""
         self._on_activated = on_activated
+
+    def capture_camera(self) -> QPointF:
+        """Scene point currently shown at the viewport center."""
+        return self.mapToScene(self.viewport().rect().center())
+
+    def restore_camera(self, scene_center: QPointF) -> None:
+        """Keep `scene_center` at the viewport center after a scene-rect change."""
+        current = self.mapFromScene(scene_center)
+        target = self.viewport().rect().center()
+        self.horizontalScrollBar().setValue(
+            int(round(self.horizontalScrollBar().value() + current.x() - target.x()))
+        )
+        self.verticalScrollBar().setValue(
+            int(round(self.verticalScrollBar().value() + current.y() - target.y()))
+        )
+
+    def visible_scene_rect(self) -> QRectF:
+        """Axis-aligned scene rect currently shown in this viewport."""
+        return self.mapToScene(self.viewport().rect()).boundingRect()
 
     def fit_scene_rect(self, rect: QRectF) -> None:
         """
@@ -161,7 +310,7 @@ class ElectrodeArrayView(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:  # type: ignore[override]
         """
-        Handle mouse click: add mode or start interaction for undo.
+        Handle mouse click: add mode, pan, or selection.
         """
         self._on_activated()
         # Middle button drag pans the view.
@@ -180,8 +329,6 @@ class ElectrodeArrayView(QGraphicsView):
                 self._add_at(scene_pos.x(), scene_pos.y())
                 event.accept()
                 return
-            # Otherwise, record state for potential undo on drag end.
-            self._interaction_begin()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
@@ -199,7 +346,7 @@ class ElectrodeArrayView(QGraphicsView):
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[override]
         """
-        On click release, finalize interaction (commit undo if needed).
+        End middle-button pan, then let Qt finish the click (selection).
         """
         if event.button() == Qt.MiddleButton and self._is_middle_panning:
             self._is_middle_panning = False
@@ -210,8 +357,7 @@ class ElectrodeArrayView(QGraphicsView):
 
         super().mouseReleaseEvent(event)
         if event.button() == Qt.LeftButton:
-            # Commit undo snapshot if something changed during drag.
-            self._interaction_end()
+            self.viewport().update()
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
         """
@@ -240,6 +386,11 @@ class ElectrodeArrayView(QGraphicsView):
         # Remember which scene point is under the cursor before scaling.
         scene_pos_before = self.mapToScene(mouse_pos)
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        current = abs(self.transform().m11())
+        new_scale = current * factor
+        if new_scale < ZOOM_MIN_SCALE or new_scale > ZOOM_MAX_SCALE:
+            event.accept()
+            return
         self.scale(factor, factor)
 
         # After scale, that scene point moved in viewport; adjust scrollbars
@@ -249,8 +400,8 @@ class ElectrodeArrayView(QGraphicsView):
         self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + delta_view.x())
         self.verticalScrollBar().setValue(self.verticalScrollBar().value() + delta_view.y())
 
-        # Labels use ItemIgnoresTransformations; refresh their layout for new scale.
-        self._on_view_transform_changed()
+        # Relayout this camera's label copies only; the other view is unchanged.
+        self._on_view_transform_changed(self)
 
     def scrollContentsBy(self, dx: int, dy: int) -> None:  # type: ignore[override]
         """
@@ -279,7 +430,7 @@ class ElectrodeArrayView(QGraphicsView):
         if scene is None or not hasattr(scene, "get_axes"):
             return
         # Axes come from unique electrode X/Y; grid follows electrode layout.
-        xs, ys = scene.get_axes()  # type: ignore[attr-defined]
+        xs, ys = scene.get_axes(self)  # type: ignore[attr-defined]
         if not xs and not ys:
             return
         grid_pen = QPen(QColor("#3b4f66"))
@@ -301,7 +452,7 @@ class ElectrodeArrayView(QGraphicsView):
         if scene is None or not hasattr(scene, "get_axes"):
             return
 
-        xs, ys = scene.get_axes()  # type: ignore[attr-defined]
+        xs, ys = scene.get_axes(self)  # type: ignore[attr-defined]
         if not xs and not ys:
             return
 

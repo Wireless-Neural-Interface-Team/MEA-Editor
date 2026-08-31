@@ -11,6 +11,7 @@ This module intentionally stays minimal:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Iterable
 
 from .contact_shape import CONTACT_SHAPES, DEFAULT_ELECTRODE_SHAPE
 
@@ -22,13 +23,15 @@ DEFAULT_SHAPE = DEFAULT_ELECTRODE_SHAPE
 ELECTRODE_SHAPES = CONTACT_SHAPES
 DEFAULT_PLANE_AXIS = (1.0, 0.0, 0.0, 1.0)
 BUILTIN_ATTRIBUTE_KEYS = ("potentiostat_id", "intan_id", "manufacturer_id", "shank_id")
+DEFAULT_MAP_LABEL_KEYS = ("potentiostat_id", "intan_id", "shank_id")
+_CENTER_MAP_LABEL_KEYS = frozenset({"potentiostat_id", "shank_id"})
 
 AttrValue = str | int | float
 
 
 def electrode_center_label(potentiostat_id: int, shank_id: str) -> str:
     """
-    Map label at the contact center: shank + potentiostat ID.
+    Compact identity used outside map views (combo boxes, etc.).
 
     Format:
     - with shank: "<shank>-<potentiostat 3 digits>" (example: "1-002")
@@ -39,6 +42,57 @@ def electrode_center_label(potentiostat_id: int, shank_id: str) -> str:
     return f"{shank}-{potentiostat}" if shank else potentiostat
 
 
+def format_map_label_value(key: str, value: AttrValue) -> str:
+    """Format one electrode attribute for a map-view label."""
+    if key == "potentiostat_id":
+        try:
+            return f"{int(value):03d}"
+        except (TypeError, ValueError):
+            return str(value).strip()
+    return str(value).strip()
+
+
+def electrode_map_view_labels(
+    values: dict[str, AttrValue],
+    visible_keys: Iterable[str] | None = None,
+    schema_keys: Iterable[str] | None = None,
+) -> tuple[str, str]:
+    """
+    Labels drawn on electrode and pad map items.
+
+    Returns (center_text, below_text):
+    - center: shank and/or potentiostat when those IDs are visible
+    - below: other visible IDs in schema order (INTAN, manufacturer, extras)
+    """
+    visible = set(DEFAULT_MAP_LABEL_KEYS if visible_keys is None else visible_keys)
+    order = list(BUILTIN_ATTRIBUTE_KEYS if schema_keys is None else schema_keys)
+    for key in visible:
+        if key not in order:
+            order.append(key)
+
+    center_parts: list[str] = []
+    if "shank_id" in visible:
+        shank = format_map_label_value("shank_id", values.get("shank_id", ""))
+        if shank:
+            center_parts.append(shank)
+    if "potentiostat_id" in visible:
+        center_parts.append(
+            format_map_label_value("potentiostat_id", values.get("potentiostat_id", 0))
+        )
+    center = "-".join(center_parts)
+
+    below_parts: list[str] = []
+    for key in order:
+        if key not in visible or key in _CENTER_MAP_LABEL_KEYS:
+            continue
+        text = format_map_label_value(key, values.get(key, ""))
+        if not text and key == "intan_id":
+            text = "?"
+        if text:
+            below_parts.append(text)
+    return center, "\n".join(below_parts)
+
+
 @dataclass(frozen=True, slots=True)
 class ElectrodeSnapshot:
     """Immutable copy of editable electrode fields for undo/redo."""
@@ -47,7 +101,6 @@ class ElectrodeSnapshot:
     y: float
     radius: float
     height: float
-    enabled: bool
     potentiostat_id: int
     intan_id: str
     manufacturer_id: str
@@ -67,7 +120,7 @@ class Electrode:
     - identification: potentiostat_id, intan_id, manufacturer_id, shank_id
     - extra attributes: file-defined key/value map (`extra`)
     - orientation metadata: contact_plane_axis (x0, x1, y0, y1)
-    - editor state: duplicate flags, enabled
+    - editor state: duplicate flags
 
     Notes:
     - shape is a SpikeInterface contact shape: circle, square, or rect.
@@ -83,7 +136,6 @@ class Electrode:
     y: float
     radius: float = DEFAULT_RADIUS
     height: float = 0.0
-    enabled: bool = True
     potentiostat_id: int = 0
     intan_id: str = DEFAULT_INTAN_ID
     manufacturer_id: str = DEFAULT_MANUFACTURER_ID
@@ -105,7 +157,6 @@ class Electrode:
             y=self.y,
             radius=self.radius,
             height=self.height,
-            enabled=self.enabled,
             potentiostat_id=self.potentiostat_id,
             intan_id=self.intan_id,
             manufacturer_id=self.manufacturer_id,
@@ -121,7 +172,6 @@ class Electrode:
         self.y = snap.y
         self.radius = snap.radius
         self.height = snap.height
-        self.enabled = snap.enabled
         self.potentiostat_id = snap.potentiostat_id
         self.intan_id = snap.intan_id
         self.manufacturer_id = snap.manufacturer_id
@@ -139,7 +189,6 @@ class Electrode:
             y=snap.y,
             radius=snap.radius,
             height=snap.height,
-            enabled=snap.enabled,
             potentiostat_id=snap.potentiostat_id,
             intan_id=snap.intan_id,
             manufacturer_id=snap.manufacturer_id,
@@ -163,8 +212,22 @@ class Electrode:
             self.extra[key] = value
 
     def map_center_label(self) -> str:
-        """Center map label: shank + potentiostat ID."""
+        """Compact identity: shank + potentiostat ID (combo boxes, etc.)."""
         return electrode_center_label(self.potentiostat_id, self.shank_id)
+
+    def map_view_labels(
+        self,
+        visible_keys: Iterable[str] | None = None,
+        schema_keys: Iterable[str] | None = None,
+    ) -> tuple[str, str]:
+        """Map-view labels from the visible electrode IDs."""
+        order = list(BUILTIN_ATTRIBUTE_KEYS if schema_keys is None else schema_keys)
+        keys = DEFAULT_MAP_LABEL_KEYS if visible_keys is None else visible_keys
+        values: dict[str, AttrValue] = {key: self.get_attribute(key) for key in order}
+        for key in keys:
+            if key not in values:
+                values[key] = self.get_attribute(key)
+        return electrode_map_view_labels(values, keys, order)
 
     def has_any_duplicate(self) -> bool:
         """True if a pairing or identifier condition should highlight this electrode."""

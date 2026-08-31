@@ -4,10 +4,15 @@ Non-modal electrode table window.
 Shows every electrode (geometry, identifiers, extra attributes, linked pad)
 in a sortable table. Search and per-attribute filters hide rows. Selecting a
 row selects that electrode and its pad in the mapping views.
+
+Geometry columns (radius / width / height) use the same full-extent values as
+the side panel and Excel export. Circle fills radius; square fills width and
+height with the same side length; rect fills width and height independently.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Iterable
 
 from PySide6.QtCore import (
@@ -36,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 from .attribute_schema import AttributeSpec
+from .contact_shape import export_contact_sizes
 from .electrode import Electrode
 from .pad import Pad
 
@@ -50,21 +56,19 @@ FIXED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("y", "Y"),
     ("shape", "Shape"),
     ("radius", "Radius"),
+    ("width", "Width"),
     ("height", "Height"),
-    ("enabled", "Enabled"),
     ("contact_plane_axis", "Contact plane"),
 )
 PAD_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("pad_pid", "Pad ID"),
-    ("pad_interface_id", "Interface ID"),
-    ("pad_system_id", "System ID"),
+    ("pad_id", "Pad ID"),
 )
 
 
 def pads_by_electrode(pads: Iterable[Pad] | None) -> dict[int, Pad]:
-    """Map each electrode eid to its first pad (lowest pid)."""
+    """Map each electrode eid to its first pad (lowest pad_id)."""
     mapping: dict[int, Pad] = {}
-    for pad in sorted(pads or [], key=lambda item: item.pid):
+    for pad in sorted(pads or [], key=lambda item: item.pad_id):
         mapping.setdefault(pad.electrode_eid, pad)
     return mapping
 
@@ -92,24 +96,49 @@ def format_plane_axis(axis: tuple[float, float, float, float]) -> str:
     return ", ".join(f"{value:g}" for value in axis)
 
 
+def _sort_cmp(left: Any, right: Any) -> int:
+    """Compare two SORT_ROLE values. Empty cells sort first. Returns -1, 0, or 1."""
+    left_empty = left is None or left == ""
+    right_empty = right is None or right == ""
+    if left_empty and right_empty:
+        return 0
+    if left_empty:
+        return -1
+    if right_empty:
+        return 1
+    try:
+        if left < right:
+            return -1
+        if left > right:
+            return 1
+        return 0
+    except TypeError:
+        left_text = str(left)
+        right_text = str(right)
+        if left_text < right_text:
+            return -1
+        if left_text > right_text:
+            return 1
+        return 0
+
+
 def electrode_row(
     model: Electrode,
     pad: Pad | None,
     schema: Iterable[AttributeSpec],
 ) -> dict[str, Any]:
     """Raw values for one table row, keyed by column key."""
+    radius, width, height = export_contact_sizes(model.shape, model.radius, model.height)
     row: dict[str, Any] = {
         "eid": int(model.eid),
         "x": float(model.x),
         "y": float(model.y),
         "shape": str(model.shape),
-        "radius": float(model.radius),
-        "height": float(model.height),
-        "enabled": bool(model.enabled),
+        "radius": radius,
+        "width": width,
+        "height": height,
         "contact_plane_axis": format_plane_axis(model.contact_plane_axis),
-        "pad_pid": int(pad.pid) if pad is not None else None,
-        "pad_interface_id": pad.interface_id if pad is not None else "",
-        "pad_system_id": pad.system_id if pad is not None else "",
+        "pad_id": int(pad.pad_id) if pad is not None else None,
     }
     for spec in schema:
         row[spec.key] = model.get_attribute(spec.key)
@@ -256,6 +285,17 @@ class ElectrodeTableFilterProxy(QSortFilterProxyModel):
         self._attribute_filters.clear()
         self.invalidateFilter()
 
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # type: ignore[override]
+        """Compare SORT_ROLE values, with empty cells first and eid as a tie-break."""
+        cmp = _sort_cmp(left.data(SORT_ROLE), right.data(SORT_ROLE))
+        if cmp != 0:
+            return cmp < 0
+        left_eid = left.data(EID_ROLE)
+        right_eid = right.data(EID_ROLE)
+        if left_eid is None or right_eid is None:
+            return False
+        return int(left_eid) < int(right_eid)
+
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # type: ignore[override]
         model = self.sourceModel()
         if not isinstance(model, ElectrodeTableModel):
@@ -293,6 +333,8 @@ class ElectrodeTableWindow(QWidget):
         self._schema: list[AttributeSpec] = []
         self._syncing_selection = False
         self._filter_combos: dict[str, QComboBox] = {}
+        self._remembered_eids: set[int] = set()
+        self._sort_initialized = False
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search all columns…")
@@ -361,6 +403,8 @@ class ElectrodeTableWindow(QWidget):
         pads: Iterable[Pad],
         schema: Iterable[AttributeSpec],
         selected_eids: Iterable[int] | None = None,
+        *,
+        scroll_to_selection: bool = False,
     ) -> None:
         """Rebuild rows/columns from the current array, keeping filters when possible."""
         schema_list = list(schema)
@@ -368,10 +412,12 @@ class ElectrodeTableWindow(QWidget):
             key: combo.currentText()
             for key, combo in self._filter_combos.items()
         }
-        selected = set(selected_eids) if selected_eids is not None else self.selected_eids()
+        selected = set(selected_eids) if selected_eids is not None else set(self._remembered_eids)
         header = self.table.horizontalHeader()
         sort_col = header.sortIndicatorSection()
         sort_order = header.sortIndicatorOrder()
+        v_scroll = self.table.verticalScrollBar().value()
+        h_scroll = self.table.horizontalScrollBar().value()
 
         self._syncing_selection = True
         try:
@@ -379,13 +425,21 @@ class ElectrodeTableWindow(QWidget):
             self.proxy.clear_attribute_filters()
             self.model.reload(electrodes, pads, schema_list)
             self._rebuild_filter_combos(previous_filters)
-            if 0 <= sort_col < self.proxy.columnCount():
-                self.proxy.sort(sort_col, sort_order)
+            if not self._sort_initialized:
+                pot_col = self.model.column_index("potentiostat_id")
+                if pot_col >= 0:
+                    self.table.sortByColumn(pot_col, Qt.AscendingOrder)
+                self._sort_initialized = True
+            elif 0 <= sort_col < self.proxy.columnCount():
+                self.table.sortByColumn(sort_col, sort_order)
             self._fit_columns()
             self._update_count()
         finally:
             self._syncing_selection = False
-        self.set_selected_eids(selected)
+        self.set_selected_eids(selected, scroll=scroll_to_selection)
+        if not scroll_to_selection:
+            self.table.verticalScrollBar().setValue(v_scroll)
+            self.table.horizontalScrollBar().setValue(h_scroll)
 
     def selected_eids(self) -> set[int]:
         eids: set[int] = set()
@@ -398,13 +452,14 @@ class ElectrodeTableWindow(QWidget):
                 eids.add(int(eid))
         return eids
 
-    def set_selected_eids(self, eids: Iterable[int]) -> None:
+    def set_selected_eids(self, eids: Iterable[int], *, scroll: bool = True) -> None:
         """Highlight table rows for the given electrode ids without emitting a choice."""
         wanted = {int(eid) for eid in eids}
-        if wanted == self.selected_eids():
-            return
+        self._remembered_eids = wanted
         selection_model = self.table.selectionModel()
         if selection_model is None:
+            return
+        if wanted == self.selected_eids():
             return
         self._syncing_selection = True
         try:
@@ -423,7 +478,7 @@ class ElectrodeTableWindow(QWidget):
                 selection,
                 QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
             )
-            if first_index is not None:
+            if scroll and first_index is not None:
                 self.table.scrollTo(first_index)
         finally:
             self._syncing_selection = False
@@ -445,46 +500,62 @@ class ElectrodeTableWindow(QWidget):
                 widget.deleteLater()
         self._filter_combos.clear()
         rows = self.model.rows_data()
-        for spec in self._schema:
+        filter_fields = [(spec.key, spec.label) for spec in self._schema]
+        filter_fields.append(("pad_id", "Pad ID"))
+        for key, field_label in filter_fields:
             combo = QComboBox()
             combo.setMinimumWidth(110)
             combo.setMaxVisibleItems(20)
             combo.addItem(ALL_FILTER)
-            combo.addItems(unique_attribute_values(rows, spec.key))
-            wanted = previous.get(spec.key, ALL_FILTER)
+            combo.addItems(unique_attribute_values(rows, key))
+            wanted = previous.get(key, ALL_FILTER)
             index = combo.findText(wanted)
             combo.setCurrentIndex(index if index >= 0 else 0)
             combo.currentTextChanged.connect(
-                lambda text, key=spec.key: self._on_attribute_filter_changed(key, text)
+                lambda text, filter_key=key: self._on_attribute_filter_changed(filter_key, text)
             )
-            self.proxy.set_attribute_filter(spec.key, combo.currentText())
-            self._filter_combos[spec.key] = combo
+            self.proxy.set_attribute_filter(key, combo.currentText())
+            self._filter_combos[key] = combo
             cell = QWidget()
             cell_layout = QVBoxLayout(cell)
             cell_layout.setContentsMargins(0, 0, 0, 0)
             cell_layout.setSpacing(2)
-            label = QLabel(spec.label)
-            cell_layout.addWidget(label)
+            caption = QLabel(field_label)
+            cell_layout.addWidget(caption)
             cell_layout.addWidget(combo)
             self.filters_layout.addWidget(cell)
         self.filters_layout.addStretch(1)
 
     def _on_search_changed(self, text: str) -> None:
-        self.proxy.set_search(text)
-        self._update_count()
+        self._apply_filter_change(lambda: self.proxy.set_search(text))
 
     def _on_attribute_filter_changed(self, key: str, text: str) -> None:
-        self.proxy.set_attribute_filter(key, text)
-        self._update_count()
+        self._apply_filter_change(lambda: self.proxy.set_attribute_filter(key, text))
 
     def _clear_filters(self) -> None:
-        self.search_edit.clear()
-        for key, combo in self._filter_combos.items():
-            combo.blockSignals(True)
-            combo.setCurrentIndex(0)
-            combo.blockSignals(False)
-            self.proxy.set_attribute_filter(key, ALL_FILTER)
-        self._update_count()
+        def reset() -> None:
+            self.search_edit.blockSignals(True)
+            self.search_edit.clear()
+            self.search_edit.blockSignals(False)
+            self.proxy.set_search("")
+            for key, combo in self._filter_combos.items():
+                combo.blockSignals(True)
+                combo.setCurrentIndex(0)
+                combo.blockSignals(False)
+                self.proxy.set_attribute_filter(key, ALL_FILTER)
+
+        self._apply_filter_change(reset)
+
+    def _apply_filter_change(self, apply: Callable[[], None]) -> None:
+        """Invalidate filters without notifying the editor, then restore the selection."""
+        remembered = set(self._remembered_eids)
+        self._syncing_selection = True
+        try:
+            apply()
+            self._update_count()
+        finally:
+            self._syncing_selection = False
+        self.set_selected_eids(remembered, scroll=False)
 
     def _update_count(self) -> None:
         visible = self.proxy.rowCount()
@@ -494,5 +565,6 @@ class ElectrodeTableWindow(QWidget):
     def _on_table_selection_changed(self, *_args) -> None:
         if self._syncing_selection:
             return
-        eids = sorted(self.selected_eids())
-        self.electrodes_chosen.emit(eids)
+        eids = self.selected_eids()
+        self._remembered_eids = set(eids)
+        self.electrodes_chosen.emit(sorted(eids))

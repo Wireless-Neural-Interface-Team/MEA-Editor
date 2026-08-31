@@ -8,8 +8,10 @@ from mea_editor.attribute_schema import AttributeSpec, default_schema
 from mea_editor.electrode import Electrode
 from mea_editor.electrode_table_window import (
     ALL_FILTER,
+    EID_ROLE,
     EMPTY_FILTER,
     ElectrodeTableWindow,
+    _sort_cmp,
     electrode_row,
     format_cell,
     pads_by_electrode,
@@ -47,7 +49,7 @@ def _sample() -> tuple[list[Electrode], list[Pad], list[AttributeSpec]]:
         ),
     ]
     pads = [
-        Pad(pid=1, electrode_eid=2, x=100.0, y=20.0, interface_id="PIN-01", system_id="INTAN"),
+        Pad(pad_id=1, electrode_eid=2, x=100.0, y=20.0),
     ]
     return electrodes, pads, schema
 
@@ -57,11 +59,24 @@ class ElectrodeTableHelpersTests(unittest.TestCase):
         _electrodes, _pads, schema = _sample()
         keys = [key for key, _label in table_columns(schema)]
         self.assertIn("eid", keys)
+        self.assertIn("radius", keys)
+        self.assertIn("width", keys)
+        self.assertIn("height", keys)
         self.assertIn("intan_id", keys)
         self.assertIn("site_note", keys)
-        self.assertIn("pad_interface_id", keys)
+        self.assertIn("pad_id", keys)
+        self.assertLess(keys.index("radius"), keys.index("width"))
+        self.assertLess(keys.index("width"), keys.index("height"))
         self.assertLess(keys.index("intan_id"), keys.index("site_note"))
-        self.assertLess(keys.index("site_note"), keys.index("pad_interface_id"))
+        self.assertLess(keys.index("site_note"), keys.index("pad_id"))
+
+    def test_pads_by_electrode_picks_lowest_pad_id(self) -> None:
+        pads = [
+            Pad(pad_id=5, electrode_eid=2, x=0.0, y=0.0),
+            Pad(pad_id=1, electrode_eid=2, x=0.0, y=0.0),
+        ]
+        mapping = pads_by_electrode(pads)
+        self.assertEqual(mapping[2].pad_id, 1)
 
     def test_row_includes_attribute_and_linked_pad(self) -> None:
         electrodes, pads, schema = _sample()
@@ -70,12 +85,37 @@ class ElectrodeTableHelpersTests(unittest.TestCase):
         self.assertEqual(row["eid"], 2)
         self.assertEqual(row["intan_id"], "A-003")
         self.assertEqual(row["site_note"], "deep")
-        self.assertEqual(row["pad_interface_id"], "PIN-01")
-        self.assertEqual(row["pad_pid"], 1)
+        self.assertEqual(row["pad_id"], 1)
 
         empty_pad_row = electrode_row(electrodes[1], pad_map.get(5), schema)
-        self.assertEqual(empty_pad_row["pad_interface_id"], "")
-        self.assertEqual(empty_pad_row["pad_pid"], None)
+        self.assertIsNone(empty_pad_row["pad_id"])
+
+    def test_row_geometry_matches_ui_and_export_sizes(self) -> None:
+        schema = default_schema()
+        circle = Electrode(eid=1, x=0.0, y=0.0, radius=12.0, height=8.0, shape="circle")
+        square = Electrode(eid=2, x=0.0, y=0.0, radius=6.0, height=0.0, shape="square")
+        rect = Electrode(eid=3, x=0.0, y=0.0, radius=12.0, height=8.0, shape="rect")
+
+        circle_row = electrode_row(circle, None, schema)
+        self.assertEqual(circle_row["radius"], 12.0)
+        self.assertIsNone(circle_row["width"])
+        self.assertIsNone(circle_row["height"])
+
+        square_row = electrode_row(square, None, schema)
+        self.assertIsNone(square_row["radius"])
+        self.assertEqual(square_row["width"], 12.0)
+        self.assertEqual(square_row["height"], 12.0)
+
+        rect_row = electrode_row(rect, None, schema)
+        self.assertIsNone(rect_row["radius"])
+        self.assertEqual(rect_row["width"], 24.0)
+        self.assertEqual(rect_row["height"], 16.0)
+
+    def test_sort_cmp_puts_empty_cells_first(self) -> None:
+        self.assertEqual(_sort_cmp(None, 4), -1)
+        self.assertEqual(_sort_cmp(4, None), 1)
+        self.assertEqual(_sort_cmp(None, None), 0)
+        self.assertEqual(_sort_cmp(1, 2), -1)
 
     def test_search_matches_any_column(self) -> None:
         electrodes, pads, schema = _sample()
@@ -83,7 +123,7 @@ class ElectrodeTableHelpersTests(unittest.TestCase):
         display = [format_cell(value) for value in row.values()]
         attribute_display = {spec.key: format_cell(row[spec.key]) for spec in schema}
         self.assertTrue(row_matches(display, "A-003", {}, attribute_display))
-        self.assertTrue(row_matches(display, "pin-01", {}, attribute_display))
+        self.assertTrue(row_matches(display, "1", {}, attribute_display))
         self.assertFalse(row_matches(display, "missing", {}, attribute_display))
 
     def test_attribute_filter_exact_and_empty(self) -> None:
@@ -128,6 +168,7 @@ class ElectrodeTableWindowTests(unittest.TestCase):
         self.assertEqual(window.model.rowCount(), 2)
         self.assertEqual(window.proxy.rowCount(), 2)
         self.assertIn("intan_id", window._filter_combos)
+        self.assertIn("pad_id", window._filter_combos)
 
         window.search_edit.setText("A-003")
         self.assertEqual(window.proxy.rowCount(), 1)
@@ -143,6 +184,81 @@ class ElectrodeTableWindowTests(unittest.TestCase):
         self.assertTrue(chosen)
         self.assertEqual(len(chosen[-1]), 1)
         window.close()
+
+    def test_search_does_not_emit_or_drop_selection(self) -> None:
+        electrodes, pads, schema = _sample()
+        window = ElectrodeTableWindow()
+        chosen: list[list[int]] = []
+        window.electrodes_chosen.connect(chosen.append)
+        window.reload(electrodes, pads, schema, selected_eids=[2])
+        self.assertEqual(window.selected_eids(), {2})
+        chosen.clear()
+
+        window.search_edit.setText("no-such-value-zzz")
+        self.assertEqual(window.proxy.rowCount(), 0)
+        self.assertEqual(chosen, [])
+        self.assertEqual(window._remembered_eids, {2})
+
+        window.search_edit.clear()
+        self.assertEqual(window.proxy.rowCount(), 2)
+        self.assertEqual(window.selected_eids(), {2})
+        self.assertEqual(chosen, [])
+        window.close()
+
+    def test_default_sort_is_potentiostat_then_eid(self) -> None:
+        schema = default_schema()
+        electrodes = [
+            Electrode(eid=1, x=0.0, y=0.0, potentiostat_id=8),
+            Electrode(eid=10, x=1.0, y=0.0, potentiostat_id=1),
+        ]
+        window = ElectrodeTableWindow()
+        window.reload(electrodes, [], schema)
+        visible = [
+            window.proxy.index(row, 0).data(EID_ROLE)
+            for row in range(window.proxy.rowCount())
+        ]
+        self.assertEqual(visible, [10, 1])
+        window.close()
+
+    def test_sort_pad_id_with_missing_values(self) -> None:
+        from PySide6.QtCore import Qt
+
+        electrodes, pads, schema = _sample()
+        window = ElectrodeTableWindow()
+        window.reload(electrodes, pads, schema)
+        pad_col = window.model.column_index("pad_id")
+        self.assertGreaterEqual(pad_col, 0)
+        window.table.sortByColumn(pad_col, Qt.AscendingOrder)
+        visible = [
+            window.proxy.index(row, 0).data(EID_ROLE)
+            for row in range(window.proxy.rowCount())
+        ]
+        self.assertEqual(visible, [5, 2])
+        window.close()
+
+
+class AddAttributeDialogTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        cls._app = QApplication.instance() or QApplication([])
+
+    def test_unique_scope_per_shank(self) -> None:
+        from mea_editor.attribute_schema import default_schema
+        from mea_editor.electrode_array_dialogs import AddAttributeDialog
+
+        dialog = AddAttributeDialog(default_schema())
+        dialog.name_edit.setText("Site note")
+        dialog.unique_check.setChecked(True)
+        dialog.scope_combo.setCurrentIndex(1)
+        spec = dialog.spec()
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.key, "site_note")
+        self.assertTrue(spec.unique)
+        self.assertEqual(spec.unique_scope, "per_shank")
+        dialog.close()
 
 
 if __name__ == "__main__":

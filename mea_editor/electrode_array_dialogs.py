@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .attribute_schema import (
+    UNIQUE_SCOPES,
     VALUE_TYPES,
     AttributeSpec,
     fallback_for_type,
@@ -74,7 +75,8 @@ class NewArrayDialog(QDialog):
     Single window used to create a new aligned array.
 
     Electrodes fill a regular grid. Pads form a rectangular frame around that
-    grid, with user-defined size, shape, number of pad rows, and spacing.
+    grid, with user-defined size, shape, number of pad rows, and center-to-center
+    spacing (same meaning as electrode pitch).
     """
 
     def __init__(self, parent=None) -> None:
@@ -103,6 +105,7 @@ class NewArrayDialog(QDialog):
         self.pitch_spin.setRange(0.001, 100000.0)
         self.pitch_spin.setDecimals(3)
         self.pitch_spin.setValue(DEFAULT_PITCH)
+        self.pitch_spin.setToolTip("Center-to-center distance between adjacent electrodes.")
         self.units_edit = QLineEdit(DEFAULT_UNITS)
         self.units_edit.setPlaceholderText("unit (e.g. um, mm)")
         self.electrode_shape_combo = QComboBox()
@@ -137,6 +140,9 @@ class NewArrayDialog(QDialog):
         self.pad_spacing_spin.setRange(0.001, 100000.0)
         self.pad_spacing_spin.setDecimals(3)
         self.pad_spacing_spin.setValue(DEFAULT_PAD_SPACING)
+        self.pad_spacing_spin.setToolTip(
+            "Center-to-center distance between adjacent pads, along a row and between rows."
+        )
 
         self.pad_size_label = QLabel(primary_size_field_label(DEFAULT_PAD_SHAPE))
         self.pad_height_label = QLabel(height_field_label())
@@ -211,9 +217,16 @@ class AddAttributeDialog(QDialog):
         self.type_combo = QComboBox()
         self.type_combo.addItems(list(VALUE_TYPES))
         self.unique_check = QCheckBox("Must be unique")
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("Globally", "global")
+        self.scope_combo.addItem("Per shank", "per_shank")
+        self.scope_combo.setEnabled(False)
+        self.scope_combo.setToolTip("When unique, compare values across the whole array or only within each shank.")
+        self.unique_check.toggled.connect(self.scope_combo.setEnabled)
         form.addRow("Name", self.name_edit)
         form.addRow("Type", self.type_combo)
         form.addRow(self.unique_check)
+        form.addRow("Uniqueness", self.scope_combo)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -228,12 +241,16 @@ class AddAttributeDialog(QDialog):
         value_type = self.type_combo.currentText().strip().lower() or "str"
         if value_type not in VALUE_TYPES:
             value_type = "str"
+        unique = self.unique_check.isChecked()
+        unique_scope = self.scope_combo.currentData()
+        if unique_scope not in UNIQUE_SCOPES:
+            unique_scope = "global"
         return AttributeSpec(
             key=unique_extra_key(label, self._schema),
             label=label,
             value_type=value_type,
             default=fallback_for_type(value_type),
             builtin=False,
-            unique=self.unique_check.isChecked(),
-            unique_scope="global",
+            unique=unique,
+            unique_scope=unique_scope if unique else "global",
         )

@@ -2,8 +2,12 @@
 Shared data structures for connector pads.
 
 Pads are not electrodes: they are interfaces toward other electronic
-systems. Each pad is associated with exactly one electrode (`electrode_eid`),
-and each electrode must have exactly one pad.
+systems. Each pad is associated with one electrode (`electrode_eid`).
+Each electrode should have exactly one pad; the editor highlights
+unpaired or shared links and asks before saving.
+
+The only pad identifier is `pad_id`, assigned by the editor like electrode `eid`.
+Users cannot define a separate pad ID.
 """
 
 from __future__ import annotations
@@ -20,8 +24,6 @@ from .contact_shape import (
 
 
 DEFAULT_PAD_RADIUS = 10.0
-DEFAULT_INTERFACE_ID = ""
-DEFAULT_SYSTEM_ID = ""
 PAD_SHAPES = CONTACT_SHAPES
 
 pad_size_field_label = primary_size_field_label
@@ -38,9 +40,6 @@ class PadSnapshot:
     y: float
     radius: float
     height: float
-    enabled: bool
-    interface_id: str
-    system_id: str
     shape: str
 
 
@@ -50,29 +49,25 @@ class Pad:
     In-memory data model for one connector pad.
 
     Field groups:
+    - identity: pad_id (editor-assigned, like electrode eid)
     - association: electrode_eid (required link to an electrode)
     - geometry: x, y, radius, height
-    - interface: interface_id, system_id
-    - editor state: duplicate / pairing flags, enabled
+    - editor state: pairing flags
 
     Notes:
     - shape is a SpikeInterface contact shape: circle, square, or rect.
     - radius is the stored half-extent along X (true radius for a circle).
     - height is the stored half-extent along Y for rect; 0 means use radius.
-    - Duplicate and pairing flags are computed by the editor and drive display color.
+    - Pairing flags are computed by the editor and drive display color.
     """
 
-    pid: int
+    pad_id: int
     electrode_eid: int
     x: float
     y: float
     radius: float = DEFAULT_PAD_RADIUS
     height: float = 0.0
-    enabled: bool = True
-    interface_id: str = DEFAULT_INTERFACE_ID
-    system_id: str = DEFAULT_SYSTEM_ID
     shape: str = DEFAULT_PAD_SHAPE
-    has_interface_duplicate: bool = False
     has_shared_electrode: bool = False
     has_missing_electrode: bool = False
 
@@ -84,44 +79,31 @@ class Pad:
             y=self.y,
             radius=self.radius,
             height=self.height,
-            enabled=self.enabled,
-            interface_id=self.interface_id,
-            system_id=self.system_id,
             shape=self.shape,
         )
 
     def restore(self, snap: PadSnapshot) -> None:
-        """Apply a snapshot onto this model (keeps pid and duplicate flags)."""
+        """Apply a snapshot onto this model (keeps pad_id and pairing flags)."""
         self.electrode_eid = snap.electrode_eid
         self.x = snap.x
         self.y = snap.y
         self.radius = snap.radius
         self.height = snap.height
-        self.enabled = snap.enabled
-        self.interface_id = snap.interface_id
-        self.system_id = snap.system_id
         self.shape = snap.shape
 
     @classmethod
-    def from_snapshot(cls, pid: int, snap: PadSnapshot) -> Pad:
+    def from_snapshot(cls, pad_id: int, snap: PadSnapshot) -> Pad:
         """Build a new pad from a snapshot."""
         return cls(
-            pid=pid,
+            pad_id=pad_id,
             electrode_eid=snap.electrode_eid,
             x=snap.x,
             y=snap.y,
             radius=snap.radius,
             height=snap.height,
-            enabled=snap.enabled,
-            interface_id=snap.interface_id,
-            system_id=snap.system_id,
             shape=snap.shape,
         )
 
     def has_any_duplicate(self) -> bool:
-        """True if a pairing or identifier condition should highlight this pad."""
-        return (
-            self.has_interface_duplicate
-            or self.has_shared_electrode
-            or self.has_missing_electrode
-        )
+        """True if a pairing condition should highlight this pad."""
+        return self.has_shared_electrode or self.has_missing_electrode

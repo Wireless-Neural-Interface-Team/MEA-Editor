@@ -2,7 +2,7 @@
 I/O layer for the electrode array editor.
 
 Native format (Save / Open):
-    mea_editor JSON — electrodes, pads, extra attributes, shapes.
+    mea_editor JSON — electrodes, pads, extra attributes, shapes, map labels.
     No probeinterface dependency.
 
 Legacy inputs still accepted:
@@ -11,15 +11,20 @@ Legacy inputs still accepted:
     3) probeinterface JSON (migrated into native fields)
 
 SpikeInterface export:
-    probeinterface JSON for recording contacts only (not pads), with:
+    probeinterface JSON for recording contacts only (pads are not SI contacts):
     - device_channel_indices = channel ID derived from INTAN ID
     - contact_ids = Contact ID from Manufacturer ID (fallback: INTAN ID)
-    - contact_annotations = native IDs, extras, and linked pad IDs
+    - contact_annotations = native IDs (including shank_id), extras, and the
+      first linked pad (pad_id plus geometry)
+    - probe annotations = electrode attribute schema and visible map labels
       so a file exported from this editor can be reopened with less data loss
 
 XLSX exports:
     analysis table (channel / row / col) and a full array workbook
-    (electrodes sheet + pads sheet).
+    (electrodes sheet + pads sheet + attribute schema). Geometry uses
+    radius / width / height (circle: radius; square: width and height;
+    rect: independent extents). Extra electrode attributes follow the file
+    schema on both electrode and pad sheets.
 """
 
 from __future__ import annotations
@@ -27,6 +32,8 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 from ._version import __version__ as EDITOR_VERSION
@@ -41,6 +48,7 @@ from .attribute_schema import (
 from .contact_shape import (
     DEFAULT_ELECTRODE_SHAPE,
     DEFAULT_PAD_SHAPE,
+    export_contact_sizes,
     extents_from_probe_params,
     normalize_contact_shape,
     probe_shape_params,
@@ -49,20 +57,19 @@ from .electrode import (
     BUILTIN_ATTRIBUTE_KEYS,
     DEFAULT_INTAN_ID,
     DEFAULT_MANUFACTURER_ID,
+    DEFAULT_MAP_LABEL_KEYS,
     DEFAULT_PLANE_AXIS,
     DEFAULT_RADIUS,
     DEFAULT_SHAPE,
     Electrode,
 )
 from .pad import (
-    DEFAULT_INTERFACE_ID,
     DEFAULT_PAD_RADIUS,
-    DEFAULT_SYSTEM_ID,
     Pad,
 )
 
 NATIVE_SPECIFICATION = "mea_editor"
-NATIVE_VERSION = "1.4"
+NATIVE_VERSION = "1.7"
 MIN_RADIUS = 0.001
 DEFAULT_UNITS = "um"
 PROBEINTERFACE_SPEC = "probeinterface"
@@ -70,6 +77,10 @@ PROBEINTERFACE_VERSION = "0.3.1"
 INTAN_CHANNELS_PER_PORT = 32
 SI_CHANNEL_ID_KEY = "channel ID"
 SI_CONTACT_ID_KEY = "Contact ID"
+MEA_EDITOR_SCHEMA_ANNOTATION_KEY = "mea_editor_electrode_attributes"
+MEA_EDITOR_MAP_LABELS_ANNOTATION_KEY = "mea_editor_map_labels"
+_MISSING = object()
+PAD_GEOMETRY_ANNOTATION_KEYS = ("pad_id", "pad_x", "pad_y", "pad_shape", "pad_radius", "pad_height")
 NATIVE_CONTACT_ANNOTATION_KEYS = frozenset(
     {
         SI_CHANNEL_ID_KEY,
@@ -82,7 +93,15 @@ NATIVE_CONTACT_ANNOTATION_KEYS = frozenset(
         "shank_id",
         "pad_interface_id",
         "pad_system_id",
+        "pad_id",
+        "pad_x",
+        "pad_y",
+        "pad_shape",
+        "pad_radius",
+        "pad_height",
         "eid",
+        MEA_EDITOR_SCHEMA_ANNOTATION_KEY,
+        MEA_EDITOR_MAP_LABELS_ANNOTATION_KEY,
     }
 )
 
@@ -96,7 +115,7 @@ _ELECTRODE_KNOWN_KEYS = frozenset(
         "y",
         "radius",
         "height",
-        "enabled",
+        "enabled",  # dropped field; ignored on load so it does not become an extra
         "potentiostat_id",
         "intan_id",
         "manufacturer_id",
@@ -109,6 +128,34 @@ _ELECTRODE_KNOWN_KEYS = frozenset(
         "extra",
     }
 )
+
+
+@dataclass
+class ArrayDocument:
+    """Loaded array: models, schema, units, and visible map-label keys."""
+
+    electrodes: list[Electrode]
+    pads: list[Pad] = field(default_factory=list)
+    si_units: str = DEFAULT_UNITS
+    electrode_attributes: list[AttributeSpec] = field(default_factory=list)
+    map_labels: list[str] = field(default_factory=list)
+
+
+def normalize_map_labels(raw: Any, schema: list[AttributeSpec]) -> list[str]:
+    """
+    Visible map-label keys in schema order.
+
+    Missing / invalid values fall back to the editor defaults. An explicit
+    empty list means every label is hidden.
+    """
+    valid = [spec.key for spec in schema]
+    valid_set = set(valid)
+    if raw is _MISSING or raw is None:
+        return [key for key in DEFAULT_MAP_LABEL_KEYS if key in valid_set]
+    if not isinstance(raw, list):
+        return [key for key in DEFAULT_MAP_LABEL_KEYS if key in valid_set]
+    selected = {str(item).strip() for item in raw if str(item).strip()}
+    return [key for key in valid if key in selected]
 
 
 def _parse_contact_plane_axis(raw_value: Any) -> tuple[float, float, float, float]:
@@ -175,15 +222,43 @@ def _annotation_at(annotations: Any, key: str, index: int) -> Any:
 
 
 def _first_pad_by_electrode(pads: list[Pad] | None) -> dict[int, Pad]:
-    """Map each electrode eid to its first pad (lowest pid). Later pads are ignored."""
+    """Map each electrode eid to its first pad (lowest pad_id). Later pads are ignored."""
     mapping: dict[int, Pad] = {}
-    for pad in sorted(pads or [], key=lambda item: item.pid):
+    for pad in sorted(pads or [], key=lambda item: item.pad_id):
         mapping.setdefault(pad.electrode_eid, pad)
     return mapping
 
 
 def _contact_plane_axis_text(axis: tuple[float, float, float, float]) -> str:
     return ", ".join(f"{value:g}" for value in axis)
+
+
+def _extra_values(model: Electrode | None, extras: list[AttributeSpec]) -> list[Any]:
+    """Row values for extra schema attributes; empty cells when there is no electrode."""
+    if model is None:
+        return ["" for _ in extras]
+    return [
+        coerce_value(spec.value_type, model.get_attribute(spec.key), spec.default)
+        for spec in extras
+    ]
+
+
+def _schema_payload_from_probe(probe: dict[str, Any]) -> Any:
+    """Read the native attribute schema stored on a probeinterface probe."""
+    annotations = probe.get("annotations")
+    if not isinstance(annotations, dict):
+        return None
+    return annotations.get(MEA_EDITOR_SCHEMA_ANNOTATION_KEY)
+
+
+def _map_labels_from_probe(probe: dict[str, Any]) -> Any:
+    """Read visible map-label keys stored on a probeinterface probe."""
+    annotations = probe.get("annotations")
+    if not isinstance(annotations, dict):
+        return _MISSING
+    if MEA_EDITOR_MAP_LABELS_ANNOTATION_KEY not in annotations:
+        return _MISSING
+    return annotations.get(MEA_EDITOR_MAP_LABELS_ANNOTATION_KEY)
 
 
 def format_intan_id(index: int, channels_per_port: int = INTAN_CHANNELS_PER_PORT) -> str:
@@ -208,7 +283,7 @@ def intan_id_to_channel_id(intan_id: str, channels_per_port: int = INTAN_CHANNEL
     Accepted forms:
     - integer string: "12" -> 12
     - port-channel: "A-003", "A003", "D-018" -> port * channels_per_port + channel
-      (A=0 … Z=25; 32 channels per port by default)
+      (A=0 … Z=25; channel must be 0 … channels_per_port-1, 32 by default)
     - disconnected: "NC", "NC1", "NC3" -> -1
 
     Raises:
@@ -229,14 +304,25 @@ def intan_id_to_channel_id(intan_id: str, channels_per_port: int = INTAN_CHANNEL
     if port_match:
         port = ord(port_match.group(1).upper()) - ord("A")
         channel = int(port_match.group(2))
-        if channel < 0:
-            raise ValueError(f"Invalid INTAN channel in « {intan_id} ».")
+        if channel < 0 or channel >= channels_per_port:
+            raise ValueError(
+                f"INTAN channel in « {intan_id} » must be 0–{channels_per_port - 1} "
+                f"(A-032 is B-000, not a valid A-port channel)."
+            )
         return port * channels_per_port + channel
 
     raise ValueError(
         f"Cannot convert INTAN ID « {intan_id} » to a channel ID. "
         "Use an integer, a port-channel like A-003, or NC for disconnected."
     )
+
+
+def try_intan_channel_id(intan_id: str, channels_per_port: int = INTAN_CHANNELS_PER_PORT) -> int | None:
+    """Return the SpikeInterface channel ID, or None if the INTAN ID is invalid."""
+    try:
+        return intan_id_to_channel_id(intan_id, channels_per_port)
+    except ValueError:
+        return None
 
 
 def _extra_from_electrode_dict(el: dict[str, Any]) -> dict[str, Any]:
@@ -271,7 +357,6 @@ def _electrode_from_native_dict(el: dict[str, Any], fallback_index: int) -> Elec
         y=_as_float(el.get("y"), 0.0),
         radius=radius,
         height=height,
-        enabled=bool(el.get("enabled", True)),
         potentiostat_id=_as_int(potentiostat_id, fallback_index),
         intan_id=_as_str(intan_id, DEFAULT_INTAN_ID),
         manufacturer_id=_as_str(manufacturer_id, DEFAULT_MANUFACTURER_ID),
@@ -322,7 +407,37 @@ def _extents_from_probe_shape(shape: str, params: Any) -> tuple[float, float]:
     return extents_from_probe_params(shape, params, DEFAULT_RADIUS, MIN_RADIUS)
 
 
-def _load_probeinterface(data: dict[str, Any]) -> tuple[list[Electrode], str]:
+def _pad_from_contact_annotations(
+    annotations: Any,
+    index: int,
+    electrode_eid: int,
+    fallback_pad_id: int,
+) -> Pad | None:
+    """Rebuild a pad from SpikeInterface contact annotations when geometry is present."""
+    x_raw = _annotation_at(annotations, "pad_x", index)
+    y_raw = _annotation_at(annotations, "pad_y", index)
+    if x_raw in (None, "") or y_raw in (None, ""):
+        return None
+    pad_id_raw = _annotation_at(annotations, "pad_id", index)
+    pad_id = fallback_pad_id if pad_id_raw in (None, "") else _as_int(pad_id_raw, fallback_pad_id)
+    shape = normalize_contact_shape(
+        _as_str(_annotation_at(annotations, "pad_shape", index), DEFAULT_PAD_SHAPE),
+        DEFAULT_PAD_SHAPE,
+    )
+    radius = max(_as_float(_annotation_at(annotations, "pad_radius", index), DEFAULT_PAD_RADIUS), MIN_RADIUS)
+    height = max(_as_float(_annotation_at(annotations, "pad_height", index), 0.0), 0.0)
+    return Pad(
+        pad_id=pad_id,
+        electrode_eid=electrode_eid,
+        x=_as_float(x_raw, 0.0),
+        y=_as_float(y_raw, 0.0),
+        radius=radius,
+        height=height,
+        shape=shape,
+    )
+
+
+def _load_probeinterface(data: dict[str, Any]) -> tuple[list[Electrode], list[Pad], str, Any, Any]:
     """
     Load a probeinterface JSON without importing probeinterface.
 
@@ -332,17 +447,23 @@ def _load_probeinterface(data: dict[str, Any]) -> tuple[list[Electrode], str]:
     - manufacturer_id left empty
 
     Files exported by this editor also store native fields in
-    `contact_annotations`; those override the default mapping when present.
+    `contact_annotations` and the attribute schema / map labels in probe
+    annotations; those override the default mapping when present.
     Extra annotation keys become electrode extra attributes.
-    Pads are not part of probeinterface and are not restored here.
+    Pads are restored only when pad geometry (`pad_x` / `pad_y`) is stored
+    in contact_annotations (mea_editor exports).
     """
     probes = data.get("probes")
     if not isinstance(probes, list) or not probes:
         raise ValueError("No probes found in probeinterface file.")
 
     models: list[Electrode] = []
+    pads: list[Pad] = []
     si_units = DEFAULT_UNITS
     fallback_eid = 0
+    fallback_pad_id = 0
+    schema_payload: Any = None
+    map_labels_payload: Any = _MISSING
     for probe in probes:
         if not isinstance(probe, dict):
             continue
@@ -358,6 +479,10 @@ def _load_probeinterface(data: dict[str, Any]) -> tuple[list[Electrode], str]:
         contact_ids = probe.get("contact_ids")
         shank_ids = probe.get("shank_ids")
         annotations = probe.get("contact_annotations")
+        if schema_payload is None:
+            schema_payload = _schema_payload_from_probe(probe)
+        if map_labels_payload is _MISSING:
+            map_labels_payload = _map_labels_from_probe(probe)
 
         for i in range(n):
             pos = positions[i]
@@ -428,7 +553,6 @@ def _load_probeinterface(data: dict[str, Any]) -> tuple[list[Electrode], str]:
                     y=y,
                     radius=radius,
                     height=height,
-                    enabled=True,
                     potentiostat_id=potentiostat_id,
                     intan_id=intan_id,
                     manufacturer_id=manufacturer_id,
@@ -438,30 +562,35 @@ def _load_probeinterface(data: dict[str, Any]) -> tuple[list[Electrode], str]:
                     extra=extra,
                 )
             )
+            pad = _pad_from_contact_annotations(annotations, i, eid, fallback_pad_id)
+            if pad is not None:
+                pads.append(pad)
+                fallback_pad_id = max(fallback_pad_id, pad.pad_id) + 1
             fallback_eid = max(fallback_eid, eid) + 1
 
     if not models:
         raise ValueError("No contacts found in probeinterface file.")
-    return models, si_units
+    return models, pads, si_units, schema_payload, map_labels_payload
 
 
 def _pad_from_native_dict(raw: dict[str, Any], fallback_index: int) -> Pad:
-    """Build a Pad from a native JSON object."""
-    pid = _as_int(raw.get("pid"), fallback_index)
+    """Build a Pad from a native JSON object.
+
+    Older files may still contain `pid`, `interface_id`, or `system_id`;
+    those keys are ignored except that `pid` is accepted as an alias for `pad_id`.
+    """
+    pad_id = _as_int(raw.get("pad_id", raw.get("pid")), fallback_index)
     electrode_eid = _as_int(raw.get("electrode_eid"), -1)
     radius = max(_as_float(raw.get("radius"), DEFAULT_PAD_RADIUS), MIN_RADIUS)
     height = max(_as_float(raw.get("height"), 0.0), 0.0)
     shape = normalize_contact_shape(_as_str(raw.get("shape"), DEFAULT_PAD_SHAPE), DEFAULT_PAD_SHAPE)
     return Pad(
-        pid=pid,
+        pad_id=pad_id,
         electrode_eid=electrode_eid,
         x=_as_float(raw.get("x"), 0.0),
         y=_as_float(raw.get("y"), 0.0),
         radius=radius,
         height=height,
-        enabled=bool(raw.get("enabled", True)),
-        interface_id=_as_str(raw.get("interface_id"), DEFAULT_INTERFACE_ID),
-        system_id=_as_str(raw.get("system_id"), DEFAULT_SYSTEM_ID),
         shape=shape,
     )
 
@@ -477,6 +606,50 @@ def _load_pads_from_payload(data: dict[str, Any]) -> list[Pad]:
             continue
         pads.append(_pad_from_native_dict(raw, i))
     return pads
+
+
+def load_array_document(path: str) -> ArrayDocument:
+    """
+    Load a full array document from a JSON file.
+
+    Supported formats:
+    1) mea_editor native JSON (pads and map_labels optional on older files)
+    2) legacy custom editor JSON
+    3) probeinterface JSON (read without the probeinterface package)
+
+    Raises:
+        ValueError: unsupported format or empty content.
+        OSError / json.JSONDecodeError: file errors (propagated).
+    """
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    if not isinstance(data, dict):
+        raise ValueError("Unsupported file format.")
+
+    spec = data.get("specification")
+    if spec == PROBEINTERFACE_SPEC:
+        models, pads, units, schema_payload, map_labels_payload = _load_probeinterface(data)
+        schema = schema_from_payload(schema_payload, models)
+        fill_electrodes_extras(models, schema, prune=False)
+        return ArrayDocument(
+            electrodes=models,
+            pads=pads,
+            si_units=units,
+            electrode_attributes=schema,
+            map_labels=normalize_map_labels(map_labels_payload, schema),
+        )
+    if spec == NATIVE_SPECIFICATION or isinstance(data.get("electrodes"), list):
+        models, units, schema = _load_native_or_legacy_custom(data)
+        return ArrayDocument(
+            electrodes=models,
+            pads=_load_pads_from_payload(data),
+            si_units=units,
+            electrode_attributes=schema,
+            map_labels=normalize_map_labels(data.get("map_labels", _MISSING), schema),
+        )
+
+    raise ValueError("Unsupported file format.")
 
 
 def load_array_from_file(path: str) -> tuple[list[Electrode], list[Pad], str, list[AttributeSpec]]:
@@ -495,23 +668,8 @@ def load_array_from_file(path: str) -> tuple[list[Electrode], list[Pad], str, li
         ValueError: unsupported format or empty content.
         OSError / json.JSONDecodeError: file errors (propagated).
     """
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
-
-    if not isinstance(data, dict):
-        raise ValueError("Unsupported file format.")
-
-    spec = data.get("specification")
-    if spec == PROBEINTERFACE_SPEC:
-        models, units = _load_probeinterface(data)
-        schema = schema_from_payload(None, models)
-        fill_electrodes_extras(models, schema, prune=False)
-        return models, [], units, schema
-    if spec == NATIVE_SPECIFICATION or isinstance(data.get("electrodes"), list):
-        models, units, schema = _load_native_or_legacy_custom(data)
-        return models, _load_pads_from_payload(data), units, schema
-
-    raise ValueError("Unsupported file format.")
+    document = load_array_document(path)
+    return document.electrodes, document.pads, document.si_units, document.electrode_attributes
 
 
 def load_electrodes_from_file(path: str) -> tuple[list[Electrode], str]:
@@ -551,7 +709,6 @@ def _electrode_to_native_dict(model: Electrode, schema: list[AttributeSpec] | No
         "y": float(model.y),
         "radius": max(float(model.radius), MIN_RADIUS),
         "height": max(float(model.height), 0.0),
-        "enabled": bool(model.enabled),
         "potentiostat_id": int(model.potentiostat_id),
         "intan_id": str(model.intan_id),
         "manufacturer_id": str(model.manufacturer_id),
@@ -574,15 +731,12 @@ def _electrode_to_native_dict(model: Electrode, schema: list[AttributeSpec] | No
 
 def _pad_to_native_dict(model: Pad) -> dict[str, Any]:
     return {
-        "pid": int(model.pid),
+        "pad_id": int(model.pad_id),
         "electrode_eid": int(model.electrode_eid),
         "x": float(model.x),
         "y": float(model.y),
         "radius": max(float(model.radius), MIN_RADIUS),
         "height": max(float(model.height), 0.0),
-        "enabled": bool(model.enabled),
-        "interface_id": str(model.interface_id),
-        "system_id": str(model.system_id),
         "shape": str(model.shape or DEFAULT_PAD_SHAPE),
     }
 
@@ -593,24 +747,29 @@ def save_electrodes_to_file(
     si_units: str,
     pads: list[Pad] | None = None,
     electrode_attributes: list[AttributeSpec] | None = None,
+    map_labels: Iterable[str] | None = None,
 ) -> None:
     """
     Save electrodes (and optional pads) in native mea_editor JSON format.
 
     Extra electrode attributes and their schema are stored in the file so the
     editor can rebuild the same fields when the file is opened again.
-    Pads, contact shapes, and geometry (including rect height) are persisted.
+    Pads, contact shapes, geometry (including rect height), and visible map
+    labels are persisted.
     """
     schema = list(electrode_attributes) if electrode_attributes is not None else schema_from_payload(None, electrodes)
-    fill_electrodes_extras(electrodes, schema, prune=False)
     ordered = sorted(electrodes, key=lambda m: m.eid)
-    ordered_pads = sorted(pads or [], key=lambda m: m.pid)
+    ordered_pads = sorted(pads or [], key=lambda m: m.pad_id)
     payload = {
         "specification": NATIVE_SPECIFICATION,
         "version": NATIVE_VERSION,
         "editor_version": EDITOR_VERSION,
         "si_units": si_units or DEFAULT_UNITS,
         "electrode_attributes": schema_to_payload(schema),
+        "map_labels": normalize_map_labels(
+            None if map_labels is None else list(map_labels),
+            schema,
+        ),
         "electrodes": [_electrode_to_native_dict(m, schema) for m in ordered],
         "pads": [_pad_to_native_dict(m) for m in ordered_pads],
     }
@@ -644,11 +803,33 @@ def _contact_ids_for_spikeinterface(electrodes: list[Electrode]) -> list[str]:
     return intan_ids
 
 
+def _pad_annotation_columns(
+    ordered: list[Electrode],
+    pad_by_eid: dict[int, Pad],
+) -> dict[str, list[Any]]:
+    """First linked pad per electrode, or empty cells when the electrode has none."""
+    columns: dict[str, list[Any]] = {key: [] for key in PAD_GEOMETRY_ANNOTATION_KEYS}
+    for model in ordered:
+        pad = pad_by_eid.get(model.eid)
+        if pad is None:
+            for key in PAD_GEOMETRY_ANNOTATION_KEYS:
+                columns[key].append("")
+            continue
+        columns["pad_id"].append(int(pad.pad_id))
+        columns["pad_x"].append(float(pad.x))
+        columns["pad_y"].append(float(pad.y))
+        columns["pad_shape"].append(str(pad.shape or DEFAULT_PAD_SHAPE))
+        columns["pad_radius"].append(max(float(pad.radius), MIN_RADIUS))
+        columns["pad_height"].append(max(float(pad.height), 0.0))
+    return columns
+
+
 def build_probeinterface_payload(
     electrodes: list[Electrode],
     si_units: str,
     pads: list[Pad] | None = None,
     electrode_attributes: list[AttributeSpec] | None = None,
+    map_labels: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """
     Build a probeinterface JSON dict for SpikeInterface.
@@ -656,8 +837,11 @@ def build_probeinterface_payload(
     Channel ID  -> device_channel_indices (from INTAN ID)
     Contact ID  -> contact_ids (from Manufacturer ID, fallback INTAN ID)
 
-    Native identifiers, extra attributes, and the first linked pad IDs are
-    stored in contact_annotations. Pads themselves are not exported as contacts.
+    Native identifiers, extra attributes, and the first linked pad (id +
+    geometry) are stored in contact_annotations. The file-level attribute
+    schema and visible map labels are stored on the probe so a reopened
+    export keeps extra-field meaning and map display. Pads themselves are
+    not exported as SpikeInterface contacts.
     """
     if not electrodes:
         raise ValueError("No electrodes to export.")
@@ -704,18 +888,13 @@ def build_probeinterface_payload(
         "potentiostat_id": [int(model.potentiostat_id) for model in ordered],
         "intan_id": [str(model.intan_id) for model in ordered],
         "manufacturer_id": [str(model.manufacturer_id) for model in ordered],
-        "pad_interface_id": [
-            str(pad_by_eid[model.eid].interface_id) if model.eid in pad_by_eid else ""
-            for model in ordered
-        ],
-        "pad_system_id": [
-            str(pad_by_eid[model.eid].system_id) if model.eid in pad_by_eid else ""
-            for model in ordered
-        ],
+        "shank_id": [str(model.shank_id) for model in ordered],
     }
-    for spec in extra_specs(schema):
+    contact_annotations.update(_pad_annotation_columns(ordered, pad_by_eid))
+    extras = extra_specs(schema)
+    for spec in extras:
         contact_annotations[spec.key] = [
-            coerce_value(spec.value_type, model.extra.get(spec.key, spec.default), spec.default)
+            coerce_value(spec.value_type, model.get_attribute(spec.key), spec.default)
             for model in ordered
         ]
 
@@ -726,6 +905,11 @@ def build_probeinterface_payload(
             "name": "mea_editor",
             "model_name": "mea_editor",
             "manufacturer": "mea_editor",
+            MEA_EDITOR_SCHEMA_ANNOTATION_KEY: schema_to_payload(schema),
+            MEA_EDITOR_MAP_LABELS_ANNOTATION_KEY: normalize_map_labels(
+                None if map_labels is None else list(map_labels),
+                schema,
+            ),
         },
         "contact_annotations": contact_annotations,
         "contact_positions": [[float(m.x), float(m.y)] for m in ordered],
@@ -760,6 +944,7 @@ def export_spikeinterface_json(
     si_units: str,
     pads: list[Pad] | None = None,
     electrode_attributes: list[AttributeSpec] | None = None,
+    map_labels: Iterable[str] | None = None,
 ) -> None:
     """
     Write a probeinterface JSON file usable by SpikeInterface.
@@ -767,13 +952,16 @@ def export_spikeinterface_json(
     The JSON contains:
     - device_channel_indices: channel ID (from INTAN ID)
     - contact_ids: Contact ID (from Manufacturer ID, fallback INTAN ID)
-    - contact_annotations: native IDs, extra attributes, linked pad IDs
+    - contact_annotations: native IDs (including shank_id), extra attributes,
+      linked pad id and geometry
+    - probe annotations: electrode attribute schema and visible map labels
     """
     payload = build_probeinterface_payload(
         electrodes,
         si_units,
         pads=pads,
         electrode_attributes=electrode_attributes,
+        map_labels=map_labels,
     )
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=4)
@@ -815,7 +1003,13 @@ def export_analysis_xlsx(
     - col: electrode x
     - shape: electrode shape
 
-    Extra identifiers, attributes, and the first linked pad follow.
+    Then radius / width / height (circle: radius; square: width and height
+    equal to the side; rect: independent width and height), INTAN ID,
+    `si_channel` (SpikeInterface channel derived from INTAN; empty if invalid),
+    manufacturer / shank / eid, extra attributes, and the first linked pad
+    (`pad_id`, `pad_x`, `pad_y`, `pad_shape`).
+
+    `channel` is the Potentiostat ID, not the SpikeInterface channel.
     """
     if not electrodes:
         raise ValueError("No electrodes to export.")
@@ -832,34 +1026,44 @@ def export_analysis_xlsx(
         "row",
         "col",
         "shape",
+        "radius",
+        "width",
+        "height",
         "intan_id",
+        "si_channel",
         "manufacturer_id",
         "shank_id",
-        "enabled",
+        "eid",
         *[spec.key for spec in extras],
-        "pad_interface_id",
-        "pad_system_id",
+        "pad_id",
+        "pad_x",
+        "pad_y",
+        "pad_shape",
     ]
     worksheet.append(headers)
     for model in sorted(electrodes, key=lambda item: (item.potentiostat_id, item.eid)):
         pad = pad_by_eid.get(model.eid)
+        radius, width, height = export_contact_sizes(model.shape, model.radius, model.height)
+        si_channel = try_intan_channel_id(model.intan_id)
         row = [
             model.potentiostat_id,
             model.y,
             model.x,
             model.shape,
+            radius,
+            width,
+            height,
             model.intan_id,
+            "" if si_channel is None else si_channel,
             model.manufacturer_id,
             model.shank_id,
-            bool(model.enabled),
+            int(model.eid),
         ]
-        row.extend(model.extra.get(spec.key, spec.default) for spec in extras)
-        row.extend(
-            [
-                pad.interface_id if pad is not None else "",
-                pad.system_id if pad is not None else "",
-            ]
-        )
+        row.extend(_extra_values(model, extras))
+        if pad is None:
+            row.extend(["", "", "", ""])
+        else:
+            row.extend([int(pad.pad_id), float(pad.x), float(pad.y), pad.shape])
         worksheet.append(row)
     workbook.save(path)
     workbook.close()
@@ -875,7 +1079,8 @@ def export_array_xlsx(
     """
     Write a full array workbook: electrodes sheet, pads sheet, schema sheet.
 
-    Existing electrode columns are kept; geometry and pad linkage are appended.
+    Extra electrode attributes follow the file schema on both the electrode
+    sheet and the linked-electrode columns of the pads sheet.
     """
     if not electrodes:
         raise ValueError("No electrodes to export.")
@@ -892,42 +1097,44 @@ def export_array_xlsx(
         "eid",
         "potentiostat_id",
         "intan_id",
+        "si_channel",
         "manufacturer_id",
         "row",
         "col",
         "shank_id",
-        "enabled",
         "shape",
         "radius",
+        "width",
         "height",
         "contact_plane_axis",
         *[spec.key for spec in extras],
-        "pad_interface_id",
-        "pad_system_id",
+        "pad_id",
         "si_units",
     ]
     electrodes_sheet.append(electrode_headers)
     for model in sorted(electrodes, key=lambda item: (item.potentiostat_id, item.eid)):
         pad = pad_by_eid.get(model.eid)
+        radius, width, height = export_contact_sizes(model.shape, model.radius, model.height)
+        si_channel = try_intan_channel_id(model.intan_id)
         row = [
             int(model.eid),
             model.potentiostat_id,
             model.intan_id,
+            "" if si_channel is None else si_channel,
             model.manufacturer_id,
             model.y,
             model.x,
             model.shank_id,
-            bool(model.enabled),
             model.shape,
-            float(model.radius),
-            float(model.height),
+            radius,
+            width,
+            height,
             _contact_plane_axis_text(model.contact_plane_axis),
         ]
-        row.extend(model.extra.get(spec.key, spec.default) for spec in extras)
+        row.extend(_extra_values(model, extras))
         row.extend(
             [
-                pad.interface_id if pad is not None else "",
-                pad.system_id if pad is not None else "",
+                int(pad.pad_id) if pad is not None else "",
                 si_units or DEFAULT_UNITS,
             ]
         )
@@ -936,42 +1143,45 @@ def export_array_xlsx(
     pads_sheet = workbook.create_sheet("pads")
     pads_sheet.append(
         [
-            "pid",
+            "pad_id",
             "electrode_eid",
             "potentiostat_id",
             "intan_id",
+            "si_channel",
             "manufacturer_id",
             "shank_id",
             "x",
             "y",
             "shape",
             "radius",
+            "width",
             "height",
-            "enabled",
-            "interface_id",
-            "system_id",
+            *[spec.key for spec in extras],
         ]
     )
-    for pad in sorted(pads or [], key=lambda item: item.pid):
+    for pad in sorted(pads or [], key=lambda item: item.pad_id):
         electrode = electrode_by_eid.get(pad.electrode_eid)
-        pads_sheet.append(
-            [
-                int(pad.pid),
-                int(pad.electrode_eid),
-                electrode.potentiostat_id if electrode is not None else "",
-                electrode.intan_id if electrode is not None else "",
-                electrode.manufacturer_id if electrode is not None else "",
-                electrode.shank_id if electrode is not None else "",
-                float(pad.x),
-                float(pad.y),
-                pad.shape,
-                float(pad.radius),
-                float(pad.height),
-                bool(pad.enabled),
-                pad.interface_id,
-                pad.system_id,
-            ]
+        radius, width, height = export_contact_sizes(pad.shape, pad.radius, pad.height)
+        si_channel = (
+            try_intan_channel_id(electrode.intan_id) if electrode is not None else None
         )
+        row = [
+            int(pad.pad_id),
+            int(pad.electrode_eid),
+            electrode.potentiostat_id if electrode is not None else "",
+            electrode.intan_id if electrode is not None else "",
+            "" if si_channel is None else si_channel,
+            electrode.manufacturer_id if electrode is not None else "",
+            electrode.shank_id if electrode is not None else "",
+            float(pad.x),
+            float(pad.y),
+            pad.shape,
+            radius,
+            width,
+            height,
+        ]
+        row.extend(_extra_values(electrode, extras))
+        pads_sheet.append(row)
 
     schema_sheet = workbook.create_sheet("electrode_attributes")
     schema_sheet.append(["key", "label", "type", "default", "builtin", "unique", "unique_scope"])

@@ -32,7 +32,7 @@ _RESERVED_KEYS = frozenset(
         "y",
         "radius",
         "height",
-        "enabled",
+        "enabled",  # dropped field; keep reserved so old files do not create an extra
         "shape",
         "contact_plane_axis",
         "channel_index",
@@ -40,9 +40,11 @@ _RESERVED_KEYS = frozenset(
         "attributes",
         "extra",
         "pid",
+        "pad_id",
         "electrode_eid",
         "interface_id",
         "system_id",
+        "mea_editor_electrode_attributes",
     }
 )
 

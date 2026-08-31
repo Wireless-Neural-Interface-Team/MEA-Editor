@@ -9,14 +9,18 @@ from pathlib import Path
 
 from mea_editor import __version__
 from mea_editor.attribute_schema import AttributeSpec, default_schema
-from mea_editor.electrode import Electrode
+from mea_editor.contact_shape import export_contact_sizes
+from mea_editor.electrode import DEFAULT_MAP_LABEL_KEYS, Electrode
 from mea_editor.electrode_array_editor_io import (
+    MEA_EDITOR_MAP_LABELS_ANNOTATION_KEY,
+    MEA_EDITOR_SCHEMA_ANNOTATION_KEY,
     NATIVE_SPECIFICATION,
     NATIVE_VERSION,
     build_probeinterface_payload,
     export_analysis_xlsx,
     export_array_xlsx,
     export_spikeinterface_json,
+    load_array_document,
     load_array_from_file,
     save_array_to_file,
 )
@@ -25,7 +29,14 @@ from mea_editor.pad import Pad
 
 def _sample_array() -> tuple[list[Electrode], list[Pad], list[AttributeSpec]]:
     schema = default_schema() + [
-        AttributeSpec(key="site_note", label="Site note", value_type="str", default="", unique=False)
+        AttributeSpec(
+            key="site_note",
+            label="Site note",
+            value_type="str",
+            default="",
+            unique=True,
+            unique_scope="per_shank",
+        )
     ]
     electrodes = [
         Electrode(
@@ -55,24 +66,20 @@ def _sample_array() -> tuple[list[Electrode], list[Pad], list[AttributeSpec]]:
     ]
     pads = [
         Pad(
-            pid=1,
+            pad_id=1,
             electrode_eid=2,
             x=-30.0,
             y=20.0,
             radius=10.0,
             height=4.0,
-            interface_id="P1",
-            system_id="INTAN",
             shape="rect",
         ),
         Pad(
-            pid=4,
+            pad_id=4,
             electrode_eid=5,
             x=80.0,
             y=20.0,
             radius=10.0,
-            interface_id="P2",
-            system_id="INTAN",
             shape="square",
         ),
     ]
@@ -84,15 +91,30 @@ class IoRoundTripTests(unittest.TestCase):
         electrodes, pads, schema = _sample_array()
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "array.json")
-            save_array_to_file(path, electrodes, "um", pads=pads, electrode_attributes=schema)
+            save_array_to_file(
+                path,
+                electrodes,
+                "um",
+                pads=pads,
+                electrode_attributes=schema,
+                map_labels=["intan_id", "site_note"],
+            )
             with open(path, encoding="utf-8") as fh:
                 payload = json.load(fh)
             self.assertEqual(payload["specification"], NATIVE_SPECIFICATION)
             self.assertEqual(payload["version"], NATIVE_VERSION)
             self.assertEqual(payload["editor_version"], __version__)
+            self.assertEqual(payload["map_labels"], ["intan_id", "site_note"])
             self.assertEqual(len(payload["electrodes"]), 2)
             self.assertEqual(len(payload["pads"]), 2)
-            loaded, loaded_pads, units, loaded_schema = load_array_from_file(path)
+            document = load_array_document(path)
+        loaded, loaded_pads, units, loaded_schema = (
+            document.electrodes,
+            document.pads,
+            document.si_units,
+            document.electrode_attributes,
+        )
+        self.assertEqual(document.map_labels, ["intan_id", "site_note"])
         self.assertEqual(units, "um")
         self.assertEqual([m.eid for m in loaded], [2, 5])
         self.assertEqual(loaded[0].shape, "rect")
@@ -102,11 +124,119 @@ class IoRoundTripTests(unittest.TestCase):
         self.assertEqual(loaded[0].extra.get("site_note"), "deep")
         extra_keys = {spec.key for spec in loaded_schema if not spec.builtin}
         self.assertIn("site_note", extra_keys)
-        self.assertEqual([p.pid for p in loaded_pads], [1, 4])
+        site_spec = next(spec for spec in loaded_schema if spec.key == "site_note")
+        self.assertEqual(site_spec.label, "Site note")
+        self.assertTrue(site_spec.unique)
+        self.assertEqual(site_spec.unique_scope, "per_shank")
+        saved_site = next(item for item in payload["electrode_attributes"] if item["key"] == "site_note")
+        self.assertEqual(saved_site["unique_scope"], "per_shank")
+        saved_pot = next(item for item in payload["electrode_attributes"] if item["key"] == "potentiostat_id")
+        self.assertEqual(saved_pot["unique_scope"], "per_shank")
+        self.assertEqual([p.pad_id for p in loaded_pads], [1, 4])
         self.assertEqual(loaded_pads[0].electrode_eid, 2)
-        self.assertEqual(loaded_pads[0].interface_id, "P1")
         self.assertEqual(loaded_pads[0].shape, "rect")
         self.assertEqual(loaded_pads[0].height, 4.0)
+        self.assertEqual(payload["pads"][0]["pad_id"], 1)
+        self.assertNotIn("enabled", payload["electrodes"][0])
+        self.assertNotIn("enabled", payload["pads"][0])
+        self.assertNotIn("pid", payload["pads"][0])
+        self.assertNotIn("interface_id", payload["pads"][0])
+        self.assertNotIn("system_id", payload["pads"][0])
+
+    def test_legacy_native_without_map_labels_uses_defaults(self) -> None:
+        payload = {
+            "specification": NATIVE_SPECIFICATION,
+            "version": "1.6",
+            "si_units": "um",
+            "electrodes": [
+                {
+                    "eid": 1,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "potentiostat_id": 0,
+                    "intan_id": "A-000",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "legacy.json")
+            Path(path).write_text(json.dumps(payload), encoding="utf-8")
+            document = load_array_document(path)
+        self.assertEqual(document.map_labels, list(DEFAULT_MAP_LABEL_KEYS))
+
+    def test_empty_map_labels_are_preserved(self) -> None:
+        electrodes, pads, schema = _sample_array()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "array.json")
+            save_array_to_file(
+                path,
+                electrodes,
+                "um",
+                pads=pads,
+                electrode_attributes=schema,
+                map_labels=[],
+            )
+            document = load_array_document(path)
+        self.assertEqual(document.map_labels, [])
+
+    def test_save_does_not_mutate_missing_extras(self) -> None:
+        schema = default_schema() + [
+            AttributeSpec(key="site_note", label="Site note", value_type="str", default="")
+        ]
+        electrode = Electrode(eid=1, x=0.0, y=0.0, extra={})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "array.json")
+            save_array_to_file(path, [electrode], "um", pads=[], electrode_attributes=schema)
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        self.assertEqual(electrode.extra, {})
+        self.assertEqual(payload["electrodes"][0]["attributes"]["site_note"], "")
+
+    def test_legacy_pad_user_ids_are_ignored(self) -> None:
+        payload = {
+            "specification": NATIVE_SPECIFICATION,
+            "version": "1.4",
+            "si_units": "um",
+            "electrodes": [
+                {
+                    "eid": 2,
+                    "x": 10.0,
+                    "y": 20.0,
+                    "radius": 12.0,
+                    "potentiostat_id": 7,
+                    "intan_id": "A-003",
+                    "enabled": False,
+                }
+            ],
+            "pads": [
+                {
+                    "pid": 9,
+                    "electrode_eid": 2,
+                    "x": 1.0,
+                    "y": 2.0,
+                    "radius": 10.0,
+                    "enabled": False,
+                    "interface_id": "P1",
+                    "system_id": "INTAN",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "legacy_pads.json")
+            Path(path).write_text(json.dumps(payload), encoding="utf-8")
+            _electrodes, pads, _units, _schema = load_array_from_file(path)
+        self.assertFalse(hasattr(_electrodes[0], "enabled"))
+        self.assertNotIn("enabled", _electrodes[0].extra)
+        self.assertEqual(len(pads), 1)
+        self.assertEqual(pads[0].pad_id, 9)
+        self.assertFalse(hasattr(pads[0], "enabled"))
+        self.assertFalse(hasattr(pads[0], "interface_id"))
+        self.assertFalse(hasattr(pads[0], "system_id"))
+
+    def test_export_contact_sizes_match_shape_params(self) -> None:
+        self.assertEqual(export_contact_sizes("circle", 12.0, 8.0), (12.0, None, None))
+        self.assertEqual(export_contact_sizes("square", 6.0, 0.0), (None, 12.0, 12.0))
+        self.assertEqual(export_contact_sizes("rect", 12.0, 8.0), (None, 24.0, 16.0))
+        self.assertEqual(export_contact_sizes("rect", 12.0, 0.0), (None, 24.0, 24.0))
 
     def test_spikeinterface_export_roundtrip_restores_native_ids(self) -> None:
         electrodes, pads, schema = _sample_array()
@@ -131,12 +261,41 @@ class IoRoundTripTests(unittest.TestCase):
             self.assertEqual(probe["contact_shapes"], ["rect", "square"])
             self.assertEqual(probe["contact_shape_params"][0]["width"], 24.0)
             self.assertEqual(probe["contact_shape_params"][0]["height"], 16.0)
+            self.assertEqual(list(probe["contact_shape_params"][1].keys()), ["width"])
+            self.assertEqual(probe["contact_shape_params"][1]["width"], 12.0)
             self.assertEqual(probe["contact_annotations"]["intan_id"], ["A-003", "A-004"])
+            self.assertEqual(probe["contact_annotations"]["shank_id"], ["1", ""])
             self.assertEqual(probe["contact_annotations"]["site_note"], ["deep", "shallow"])
-            self.assertEqual(probe["contact_annotations"]["pad_interface_id"], ["P1", "P2"])
-            loaded, loaded_pads, units, loaded_schema = load_array_from_file(path)
+            self.assertEqual(probe["contact_annotations"]["pad_id"], [1, 4])
+            self.assertEqual(probe["contact_annotations"]["pad_x"], [-30.0, 80.0])
+            self.assertEqual(probe["contact_annotations"]["pad_y"], [20.0, 20.0])
+            self.assertEqual(probe["contact_annotations"]["pad_shape"], ["rect", "square"])
+            self.assertEqual(probe["contact_annotations"]["pad_radius"], [10.0, 10.0])
+            self.assertEqual(probe["contact_annotations"]["pad_height"], [4.0, 0.0])
+            stored_schema = probe["annotations"][MEA_EDITOR_SCHEMA_ANNOTATION_KEY]
+            stored_site = next(item for item in stored_schema if item["key"] == "site_note")
+            self.assertEqual(stored_site["label"], "Site note")
+            self.assertTrue(stored_site["unique"])
+            self.assertEqual(stored_site["unique_scope"], "per_shank")
+            self.assertEqual(
+                probe["annotations"][MEA_EDITOR_MAP_LABELS_ANNOTATION_KEY],
+                list(DEFAULT_MAP_LABEL_KEYS),
+            )
+            document = load_array_document(path)
+        loaded, loaded_pads, units, loaded_schema = (
+            document.electrodes,
+            document.pads,
+            document.si_units,
+            document.electrode_attributes,
+        )
+        self.assertEqual(document.map_labels, list(DEFAULT_MAP_LABEL_KEYS))
         self.assertEqual(units, "um")
-        self.assertEqual(loaded_pads, [])
+        self.assertEqual([pad.pad_id for pad in loaded_pads], [1, 4])
+        self.assertEqual(loaded_pads[0].electrode_eid, 2)
+        self.assertEqual(loaded_pads[0].x, -30.0)
+        self.assertEqual(loaded_pads[0].shape, "rect")
+        self.assertEqual(loaded_pads[0].height, 4.0)
+        self.assertEqual(loaded_pads[1].shape, "square")
         self.assertEqual(loaded[0].intan_id, "A-003")
         self.assertEqual(loaded[0].manufacturer_id, "M3")
         self.assertEqual(loaded[0].potentiostat_id, 7)
@@ -145,6 +304,11 @@ class IoRoundTripTests(unittest.TestCase):
         self.assertEqual(loaded[0].extra.get("site_note"), "deep")
         extra_keys = {spec.key for spec in loaded_schema if not spec.builtin}
         self.assertIn("site_note", extra_keys)
+        site_spec = next(spec for spec in loaded_schema if spec.key == "site_note")
+        self.assertEqual(site_spec.label, "Site note")
+        self.assertTrue(site_spec.unique)
+        self.assertEqual(site_spec.unique_scope, "per_shank")
+        self.assertEqual(loaded[0].shank_id, "1")
 
     def test_legacy_probeinterface_without_native_annotations(self) -> None:
         payload = {
@@ -201,28 +365,100 @@ class IoRoundTripTests(unittest.TestCase):
                         "row",
                         "col",
                         "shape",
+                        "radius",
+                        "width",
+                        "height",
                         "intan_id",
+                        "si_channel",
                         "manufacturer_id",
                         "shank_id",
-                        "enabled",
+                        "eid",
                         "site_note",
-                        "pad_interface_id",
-                        "pad_system_id",
+                        "pad_id",
+                        "pad_x",
+                        "pad_y",
+                        "pad_shape",
                     ],
                 )
                 self.assertEqual(analysis_sheet["A2"].value, 7)
                 self.assertEqual(analysis_sheet["D2"].value, "rect")
-                self.assertEqual(analysis_sheet["J2"].value, "P1")
+                self.assertEqual(analysis_sheet["E2"].value, None)
+                self.assertEqual(analysis_sheet["F2"].value, 24.0)
+                self.assertEqual(analysis_sheet["G2"].value, 16.0)
+                self.assertEqual(analysis_sheet["D3"].value, "square")
+                self.assertEqual(analysis_sheet["E3"].value, None)
+                self.assertEqual(analysis_sheet["F3"].value, 12.0)
+                self.assertEqual(analysis_sheet["G3"].value, 12.0)
+                self.assertEqual(analysis_sheet["I2"].value, 3)
+                self.assertEqual(analysis_sheet["L2"].value, 2)
+                self.assertEqual(analysis_sheet["M2"].value, "deep")
+                self.assertEqual(analysis_sheet["N2"].value, 1)
+                self.assertEqual(analysis_sheet["O2"].value, -30.0)
+                self.assertEqual(analysis_sheet["P2"].value, 20.0)
+                self.assertEqual(analysis_sheet["Q2"].value, "rect")
             finally:
                 analysis.close()
 
             workbook = load_workbook(array_path)
             try:
                 self.assertEqual(workbook.sheetnames, ["array", "pads", "electrode_attributes"])
+                self.assertEqual(workbook["pads"]["A1"].value, "pad_id")
                 self.assertEqual(workbook["pads"]["A2"].value, 1)
-                self.assertEqual(workbook["pads"]["M2"].value, "P1")
+                self.assertEqual(workbook["pads"]["E1"].value, "si_channel")
+                self.assertEqual(workbook["pads"]["E2"].value, 3)
+                self.assertEqual(
+                    [cell.value for cell in workbook["array"][1][:12]],
+                    [
+                        "eid",
+                        "potentiostat_id",
+                        "intan_id",
+                        "si_channel",
+                        "manufacturer_id",
+                        "row",
+                        "col",
+                        "shank_id",
+                        "shape",
+                        "radius",
+                        "width",
+                        "height",
+                    ],
+                )
+                self.assertEqual(workbook["array"]["D2"].value, 3)
                 self.assertEqual(workbook["array"]["I2"].value, "rect")
-                self.assertEqual(workbook["array"]["N2"].value, "P1")
+                self.assertEqual(workbook["array"]["J2"].value, None)
+                self.assertEqual(workbook["array"]["K2"].value, 24.0)
+                self.assertEqual(workbook["array"]["L2"].value, 16.0)
+                self.assertEqual(workbook["array"]["I3"].value, "square")
+                self.assertEqual(workbook["array"]["J3"].value, None)
+                self.assertEqual(workbook["array"]["K3"].value, 12.0)
+                self.assertEqual(workbook["array"]["L3"].value, 12.0)
+                self.assertEqual(workbook["array"]["N2"].value, "deep")
+                self.assertEqual(workbook["array"]["O2"].value, 1)
+                self.assertEqual(
+                    [cell.value for cell in workbook["pads"][1][9:13]],
+                    ["shape", "radius", "width", "height"],
+                )
+                self.assertEqual(workbook["pads"]["J2"].value, "rect")
+                self.assertEqual(workbook["pads"]["K2"].value, None)
+                self.assertEqual(workbook["pads"]["L2"].value, 20.0)
+                self.assertEqual(workbook["pads"]["M2"].value, 8.0)
+                self.assertEqual(workbook["pads"]["J3"].value, "square")
+                self.assertEqual(workbook["pads"]["K3"].value, None)
+                self.assertEqual(workbook["pads"]["L3"].value, 20.0)
+                self.assertEqual(workbook["pads"]["M3"].value, 20.0)
+                self.assertEqual(workbook["pads"]["N2"].value, "deep")
+                self.assertEqual(workbook["pads"]["N3"].value, "shallow")
+                schema_sheet = workbook["electrode_attributes"]
+                self.assertEqual(
+                    [cell.value for cell in schema_sheet[1]],
+                    ["key", "label", "type", "default", "builtin", "unique", "unique_scope"],
+                )
+                site_row = next(
+                    row for row in schema_sheet.iter_rows(min_row=2, values_only=True) if row[0] == "site_note"
+                )
+                self.assertEqual(site_row[1], "Site note")
+                self.assertEqual(site_row[5], True)
+                self.assertEqual(site_row[6], "per_shank")
             finally:
                 workbook.close()
 
@@ -232,6 +468,9 @@ class VersionTests(unittest.TestCase):
         parts = __version__.split(".")
         self.assertGreaterEqual(len(parts), 2)
         self.assertTrue(all(part.isdigit() for part in parts))
+
+    def test_native_format_version(self) -> None:
+        self.assertEqual(NATIVE_VERSION, "1.7")
 
     def test_version_module_matches_package(self) -> None:
         from mea_editor._version import __version__ as raw

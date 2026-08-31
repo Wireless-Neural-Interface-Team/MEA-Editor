@@ -64,27 +64,28 @@ wheels = [
 
 [[package]]
 name = "mea-editor"
-version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "openpyxl" },
-    { name = "pyinstaller" },
     { name = "pyside6" },
 ]
 
 [package.optional-dependencies]
+build = [
+    { name = "pyinstaller" },
+]
 dev = [
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "openpyxl", specifier = "==3.1.0" },
-    { name = "pyinstaller", specifier = "==6.0" },
-    { name = "pyside6", specifier = "==6.5.0" },
+    { name = "openpyxl", specifier = ">=3.1.0" },
+    { name = "pyinstaller", marker = "extra == 'build'", specifier = ">=6.0" },
+    { name = "pyside6", specifier = ">=6.5.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "build"]
 
 [[package]]
 name = "openpyxl"

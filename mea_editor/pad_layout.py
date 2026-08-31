@@ -2,9 +2,11 @@
 Pad frame layout around an electrode array.
 
 Pads are placed on one or more rectangular rings surrounding the electrode
-bounding box. Counts per ring follow ring perimeters so the frame stays
-aligned with the electrode array aspect ratio. Electrodes and pads are then
-paired by angle (and radius) so links stay locally consistent.
+bounding box. `pad_spacing` is the center-to-center pitch between adjacent
+pads, along each ring and between rings, matching electrode pitch. Counts per
+ring follow ring perimeters so the frame stays aligned with the electrode
+array aspect ratio. Electrodes and pads are then paired by angle (and radius)
+so links stay locally consistent.
 """
 
 from __future__ import annotations
@@ -34,6 +36,55 @@ def _split_counts(n: int, weights: list[float]) -> list[int]:
     for i in range(remainder):
         counts[order[i]] += 1
     return counts
+
+
+def _axis_steps(sum_steps: int, span_x: float, span_y: float) -> tuple[int, int]:
+    """Split `sum_steps` into (nx, ny) following the electrode aspect ratio."""
+    if sum_steps <= 1:
+        return max(sum_steps, 1), 0
+    nx = int(round(sum_steps * span_x / (span_x + span_y)))
+    nx = min(max(nx, 1), sum_steps - 1)
+    ny = sum_steps - nx
+    if ny < 1:
+        ny = 1
+        nx = sum_steps - 1
+    return nx, ny
+
+
+def _target_inner_perimeter(n: int, rows: int, spacing: float, min_peri: float) -> float:
+    """
+    Inner-ring perimeter so each ring can hold pads at pitch `spacing`.
+
+    Outer ring r is 8 spacing-steps larger than ring 0 (width and height each
+    grow by 2 steps). Choose the inner perimeter so the sum of pads per ring
+    matches `n` when every along-ring step equals `spacing`.
+    """
+    rows = max(int(rows), 1)
+    if rows == 1:
+        return max(n * spacing, min_peri)
+    inner_steps = n / rows - 4.0 * (rows - 1)
+    return max(inner_steps * spacing, min_peri)
+
+
+def _rectangle_wh(
+    peri: float,
+    spacing: float,
+    span_x: float,
+    span_y: float,
+    min_w: float,
+    min_h: float,
+) -> tuple[float, float]:
+    """Width and height for a pad ring of perimeter `peri`."""
+    total = span_x + span_y
+    half = max(float(peri), 1e-9) * 0.5
+    width = half * span_x / total
+    height = half * span_y / total
+    steps = int(round(peri / spacing))
+    if steps >= 2 and steps % 2 == 0:
+        nx, ny = _axis_steps(steps // 2, span_x, span_y)
+        width = nx * spacing
+        height = ny * spacing
+    return max(width, min_w), max(height, min_h)
 
 
 def _point_on_rectangle(
@@ -95,7 +146,10 @@ def layout_pads_around_electrodes(
     """
     Build one pad per electrode, arranged on `pad_rows` rectangles around the array.
 
-    `pad_spacing` is the gap between pad rows and the target pitch along each ring.
+    `pad_spacing` is the center-to-center pitch between adjacent pads, along
+    each ring and between concentric rings. The frame grows to honor that
+    pitch when the electrode array leaves enough room; otherwise the inner
+    ring is enlarged just enough that pad bodies stay outside electrode bodies.
     """
     if not electrodes:
         return []
@@ -107,43 +161,56 @@ def layout_pads_around_electrodes(
     _half_x, half_y = contact_half_extents(shape, size, height)
     pad_extent = max(size, half_y)
 
-    xs = [m.x for m in electrodes]
-    ys = [m.y for m in electrodes]
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
-    clearance = electrode_radius + pad_extent + spacing
-    inner_left = min_x - clearance
-    inner_right = max_x + clearance
-    inner_bottom = min_y - clearance
-    inner_top = max_y + clearance
+    electrode_bodies: list[tuple[float, float, float, float]] = []
+    for model in electrodes:
+        hx, hy = contact_half_extents(model.shape, model.radius, model.height)
+        hx = max(hx, float(electrode_radius))
+        hy = max(hy, float(electrode_radius))
+        electrode_bodies.append((model.x, model.y, hx, hy))
+    min_x = min(x - hx for x, y, hx, hy in electrode_bodies)
+    max_x = max(x + hx for x, y, hx, hy in electrode_bodies)
+    min_y = min(y - hy for x, y, hx, hy in electrode_bodies)
+    max_y = max(y + hy for x, y, hx, hy in electrode_bodies)
+
+    span_x = max(max_x - min_x, 1e-9)
+    span_y = max(max_y - min_y, 1e-9)
+    min_w = span_x + 2.0 * pad_extent
+    min_h = span_y + 2.0 * pad_extent
+    min_peri = 2.0 * (min_w + min_h)
+    cx_box = 0.5 * (min_x + max_x)
+    cy_box = 0.5 * (min_y + max_y)
+
+    peri0 = _target_inner_perimeter(len(electrodes), rows, spacing, min_peri)
+    width0, height0 = _rectangle_wh(peri0, spacing, span_x, span_y, min_w, min_h)
 
     perimeters: list[float] = []
     frames: list[tuple[float, float, float, float]] = []
     for ring in range(rows):
-        grow = ring * spacing
-        left = inner_left - grow
-        right = inner_right + grow
-        bottom = inner_bottom - grow
-        top = inner_top + grow
+        width = width0 + 2.0 * ring * spacing
+        height = height0 + 2.0 * ring * spacing
+        left = cx_box - 0.5 * width
+        right = cx_box + 0.5 * width
+        bottom = cy_box - 0.5 * height
+        top = cy_box + 0.5 * height
         frames.append((left, right, bottom, top))
-        perimeters.append(2.0 * ((right - left) + (top - bottom)))
+        perimeters.append(2.0 * (width + height))
 
     counts = _split_counts(len(electrodes), perimeters)
     positions: list[tuple[float, float]] = []
     for frame, count in zip(frames, counts):
         positions.extend(_pads_on_rectangle(*frame, count))
 
-    cx = sum(xs) / len(xs)
-    cy = sum(ys) / len(ys)
+    cx = sum(model.x for model in electrodes) / len(electrodes)
+    cy = sum(model.y for model in electrodes) / len(electrodes)
     electrodes_sorted = sorted(electrodes, key=lambda m: _angular_key(m.x, m.y, cx, cy))
     pad_order = sorted(range(len(positions)), key=lambda i: _angular_key(*positions[i], cx, cy))
 
     pads: list[Pad] = []
-    for pid, (electrode, pos_index) in enumerate(zip(electrodes_sorted, pad_order)):
+    for pad_id, (electrode, pos_index) in enumerate(zip(electrodes_sorted, pad_order)):
         x, y = positions[pos_index]
         pads.append(
             Pad(
-                pid=pid,
+                pad_id=pad_id,
                 electrode_eid=electrode.eid,
                 x=x,
                 y=y,

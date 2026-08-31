@@ -69,6 +69,30 @@ def effective_half_height(shape: str, radius: float, height: float) -> float:
     return height if height > 0 else radius
 
 
+def export_contact_sizes(
+    shape: str, radius: float, height: float
+) -> tuple[float | None, float | None, float | None]:
+    """
+    Size columns for Excel: (radius, width, height).
+
+    Only the parameters used by `shape` are filled; the others are None
+    (empty cells). Width and height are full extents. A square fills both
+    width and height with the same side length.
+    """
+    kind = str(shape).strip().lower()
+    if kind == "square":
+        side = size_field_from_stored_half("square", radius)
+        return None, side, side
+    if kind == "rect":
+        half_h = effective_half_height(kind, radius, height)
+        return (
+            None,
+            size_field_from_stored_half("rect", radius),
+            size_field_from_stored_half("rect", half_h),
+        )
+    return size_field_from_stored_half("circle", radius), None, None
+
+
 def contact_half_extents(shape: str, radius: float, height: float) -> tuple[float, float]:
     """Return (half_width, half_height) for the given geometry."""
     return radius, effective_half_height(shape, radius, height)
