@@ -7,7 +7,7 @@ Architecture overview
 - `GridScene`: lightweight scene wrapper exposing dynamic X/Y axes (grid_scene.py)
 - `ElectrodeView`: visual/interactive representation of one `Electrode` (electrode_view.py)
 - `PadView`: visual/interactive representation of one `Pad` (pad_view.py)
-- `OrientationMarkerView`: white square fiducial, not linked to contacts (orientation_marker_view.py)
+- `OrientationMarkerView`: white fiducial (circle / square / rect), not linked to contacts (orientation_marker_view.py)
 - `ElectrodeArrayEditorQt`: main window, business logic, file workflow (this file)
 - `ElectrodeTableWindow`: non-modal table of all electrodes with search/filters
 - `attribute_schema`: file-level extra electrode attributes (this file rebuilds the panel from it)
@@ -18,7 +18,7 @@ mapping views: the left view fits the electrodes, the right view fits the pads.
 Each contact keeps a label copy per camera so zooming one view does not move text in the other.
 Each contact uses a SpikeInterface shape (circle, square, or rect).
 Pads are interfaces toward other electronic systems and each pad is
-linked to one electrode. Orientation markers are unlinked white squares
+linked to one electrode. Orientation markers are unlinked white fiducials (circle, square, or rect)
 used to read the view orientation; they are not SpikeInterface contacts.
 """
 
@@ -118,7 +118,9 @@ from .electrode_array_view import ElectrodeArrayView
 from .electrode_view import ElectrodeView
 from .grid_scene import GridScene
 from .orientation_marker import (
-    DEFAULT_MARKER_SIDE,
+    DEFAULT_MARKER_RADIUS,
+    DEFAULT_MARKER_SHAPE,
+    MARKER_SHAPES,
     OrientationMarker,
     OrientationMarkerSnapshot,
 )
@@ -628,18 +630,30 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.marker_id_edit = QLineEdit("")
         self.marker_id_edit.setReadOnly(True)
         self.marker_id_edit.setToolTip("Editor-assigned identifier. Not editable.")
-        self.marker_side_edit = QLineEdit("")
+        self.marker_radius_edit = QLineEdit("")
+        self.marker_height_edit = QLineEdit("")
         self.marker_x_edit = QLineEdit("")
         self.marker_y_edit = QLineEdit("")
         self.marker_x_edit.setToolTip("Requires exactly one selected marker. Leave empty to keep X/Y.")
         self.marker_y_edit.setToolTip("Requires exactly one selected marker. Leave empty to keep X/Y.")
+        self.marker_shape_combo = QComboBox()
+        self.marker_shape_combo.addItems(list(MARKER_SHAPES))
+        self.marker_size_label = QLabel(primary_size_field_label(DEFAULT_MARKER_SHAPE))
+        self.marker_height_label = QLabel(height_field_label())
+        self._marker_size_shape = DEFAULT_MARKER_SHAPE
         m_form.addRow("Marker ID", self.marker_id_edit)
-        m_form.addRow("Side length", self.marker_side_edit)
+        m_form.addRow("Shape", self.marker_shape_combo)
+        m_form.addRow(self.marker_size_label, self.marker_radius_edit)
+        m_form.addRow(self.marker_height_label, self.marker_height_edit)
         m_form.addRow("X / Y", self._make_row(self.marker_x_edit, self.marker_y_edit))
-        self.marker_label_position_combo = self._make_label_position_combo()
-        m_form.addRow("Label position", self.marker_label_position_combo)
-        self.marker_label_orientation_combo = self._make_label_orientation_combo()
-        m_form.addRow("Label orientation", self.marker_label_orientation_combo)
+        self._marker_form = m_form
+        self.marker_shape_combo.currentTextChanged.connect(self._on_marker_shape_combo_changed)
+        self._set_height_row_visible(
+            m_form,
+            self.marker_height_label,
+            self.marker_height_edit,
+            shape_uses_height(DEFAULT_MARKER_SHAPE),
+        )
 
         self.b_apply_marker_edits = QPushButton("Confirm marker edits")
         self.b_apply_marker_edits.setAutoDefault(False)
@@ -1106,21 +1120,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         return self._models_bounds_rect(self.pads.values(), margin=margin)
 
     def _marker_bounds_rect(self, margin: float = 0.0) -> QRectF:
-        """Bounding rect of orientation markers (center + half side)."""
-        extents: list[tuple[float, float, float, float]] = []
-        for marker in self.orientation_markers.values():
-            half = marker.half_side()
-            extents.append((marker.x, marker.y, half, half))
-        if not extents:
-            return QRectF(-1.0, -1.0, 2.0, 2.0)
-        min_x = min(x - half_x for x, y, half_x, half_y in extents)
-        max_x = max(x + half_x for x, y, half_x, half_y in extents)
-        min_y = min(y - half_y for x, y, half_x, half_y in extents)
-        max_y = max(y + half_y for x, y, half_x, half_y in extents)
-        rect = QRectF(min_x, min_y, max(max_x - min_x, 1.0), max(max_y - min_y, 1.0))
-        if margin > 0:
-            rect = rect.adjusted(-margin, -margin, margin, margin)
-        return rect
+        """Bounding rect of orientation markers (center + half-extents)."""
+        return self._models_bounds_rect(self.orientation_markers.values(), margin=margin)
 
     def _capture_state(self) -> EditorState:
         """Capture full state snapshot for undo/redo."""
@@ -1262,7 +1263,6 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.scene.addItem(item)
         self.orientation_markers[marker.marker_id] = marker
         self.marker_items[marker.marker_id] = item
-        item._layout_labels()
         return item
 
     def _set_electrodes(self, models: list[Electrode]) -> None:
@@ -1428,6 +1428,36 @@ class ElectrodeArrayEditorQt(QMainWindow):
         shape = normalize_contact_shape(shape, DEFAULT_PAD_SHAPE)
         self._pad_size_shape = shape
         self.pad_size_label.setText(primary_size_field_label(shape))
+
+    def _on_marker_shape_combo_changed(self, shape: str) -> None:
+        """Rename the size field and convert its value so the drawn marker keeps its extent."""
+        if shape == MIXED_SHAPE_LABEL:
+            return
+        shape = normalize_contact_shape(shape, DEFAULT_MARKER_SHAPE)
+        if self._marker_size_shape != MIXED_SHAPE_LABEL:
+            stored = self._convert_size_edit(self.marker_radius_edit, self._marker_size_shape, shape)
+        else:
+            stored = None
+        if shape_uses_height(shape):
+            if stored is not None:
+                self.marker_height_edit.setText(f"{size_field_from_stored_half('rect', stored):.2f}")
+            elif not self.marker_height_edit.text().strip():
+                self.marker_height_edit.setText(self.marker_radius_edit.text())
+        self._set_marker_size_label(shape)
+        self._set_height_row_visible(
+            self._marker_form,
+            self.marker_height_label,
+            self.marker_height_edit,
+            shape_uses_height(shape),
+        )
+
+    def _set_marker_size_label(self, shape: str) -> None:
+        """Update the marker size field caption without converting the current text."""
+        if shape == MIXED_SHAPE_LABEL:
+            return
+        shape = normalize_contact_shape(shape, DEFAULT_MARKER_SHAPE)
+        self._marker_size_shape = shape
+        self.marker_size_label.setText(primary_size_field_label(shape))
 
     @staticmethod
     def _make_label_position_combo() -> QComboBox:
@@ -1698,26 +1728,40 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Create a new orientation marker at (x, y) and select it."""
         before = self._capture_state()
         next_id = max(self.orientation_markers.keys(), default=-1) + 1
-        side = DEFAULT_MARKER_SIDE
-        side_text = self.marker_side_edit.text().strip()
-        if side_text:
+        shape_text = self.marker_shape_combo.currentText()
+        shape = (
+            DEFAULT_MARKER_SHAPE
+            if shape_text == MIXED_SHAPE_LABEL
+            else normalize_contact_shape(shape_text, DEFAULT_MARKER_SHAPE)
+        )
+        radius = DEFAULT_MARKER_RADIUS
+        size_text = self.marker_radius_edit.text().strip()
+        if size_text:
             try:
-                parsed = float(side_text)
+                parsed = float(size_text)
                 if parsed > 0:
-                    side = parsed
+                    radius = stored_half_from_size_field(shape, parsed)
             except ValueError:
                 pass
-        orientation = self._label_orientation_from_combo(self.marker_label_orientation_combo)
+        height = 0.0
+        if shape_uses_height(shape):
+            height_text = self.marker_height_edit.text().strip()
+            if height_text:
+                try:
+                    parsed_h = float(height_text)
+                    if parsed_h > 0:
+                        height = stored_half_from_size_field("rect", parsed_h)
+                except ValueError:
+                    pass
+            if height <= 0:
+                height = radius
         marker = OrientationMarker(
             marker_id=next_id,
             x=x,
             y=y,
-            side=side,
-            label_position=self._label_position_from_combo(self.marker_label_position_combo)
-            or DEFAULT_LABEL_POSITION,
-            label_orientation=(
-                DEFAULT_LABEL_ORIENTATION if orientation is None else orientation
-            ),
+            radius=radius,
+            height=height,
+            shape=shape,
         )
         self._is_mutating_scene = True
         try:
@@ -2191,9 +2235,13 @@ class ElectrodeArrayEditorQt(QMainWindow):
         for marker_id in a.orientation_markers:
             left = a.orientation_markers[marker_id]
             right = b.orientation_markers[marker_id]
+            if left.shape != right.shape:
+                return False
             if abs(left.x - right.x) > tol or abs(left.y - right.y) > tol:
                 return False
-            if abs(left.side - right.side) > tol:
+            if abs(left.radius - right.radius) > tol:
+                return False
+            if abs(left.height - right.height) > tol:
                 return False
             if left.label_position != right.label_position:
                 return False
@@ -2341,8 +2389,6 @@ class ElectrodeArrayEditorQt(QMainWindow):
         for item in self.items.values():
             item._layout_labels(view_attr)
         for item in self.pad_items.values():
-            item._layout_labels(view_attr)
-        for item in self.marker_items.values():
             item._layout_labels(view_attr)
 
     def _fit_target_rect(self, index: int) -> QRectF:
@@ -2957,9 +3003,15 @@ class ElectrodeArrayEditorQt(QMainWindow):
         if not selected:
             return
 
-        side_text = self.marker_side_edit.text().strip()
+        radius_text = self.marker_radius_edit.text().strip()
+        height_text = self.marker_height_edit.text().strip()
         x_text = self.marker_x_edit.text().strip()
         y_text = self.marker_y_edit.text().strip()
+        shape_text = self.marker_shape_combo.currentText()
+        apply_shape = shape_text != MIXED_SHAPE_LABEL
+        shape_value = (
+            normalize_contact_shape(shape_text, DEFAULT_MARKER_SHAPE) if apply_shape else None
+        )
 
         if (x_text and not y_text) or (y_text and not x_text):
             QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
@@ -2970,14 +3022,29 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
         before = self._capture_state()
 
-        side_field: float | None = None
-        if side_text:
+        radius_field: float | None = None
+        if radius_text:
             try:
-                side_field = float(side_text)
-                if side_field <= 0:
+                radius_field = float(radius_text)
+                if radius_field <= 0:
                     raise ValueError
             except ValueError:
-                QMessageBox.critical(self, "Invalid side length", "Side length must be a positive number.")
+                size_name = primary_size_field_label(shape_value or DEFAULT_MARKER_SHAPE)
+                QMessageBox.critical(
+                    self,
+                    f"Invalid {size_name.lower()}",
+                    f"{size_name} must be a positive number.",
+                )
+                return
+
+        height_field: float | None = None
+        if height_text:
+            try:
+                height_field = float(height_text)
+                if height_field <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.critical(self, "Invalid height", "Height must be a positive number.")
                 return
 
         x_value: float | None = None
@@ -2990,16 +3057,21 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
                 return
 
-        label_position = self._label_position_from_combo(self.marker_label_position_combo)
-        label_orientation = self._label_orientation_from_combo(self.marker_label_orientation_combo)
-
         for item in selected:
-            if side_field is not None:
-                item.set_side(side_field)
-            if label_position is not None:
-                item.model.label_position = label_position
-            if label_orientation is not None:
-                item.model.label_orientation = label_orientation
+            item_shape = (
+                shape_value
+                if apply_shape
+                else normalize_contact_shape(item.model.shape, DEFAULT_MARKER_SHAPE)
+            )
+            if apply_shape:
+                item.model.shape = item_shape
+            if radius_field is not None:
+                item.set_radius(stored_half_from_size_field(item_shape, radius_field))
+            if shape_uses_height(item_shape):
+                if height_field is not None:
+                    item.set_height(stored_half_from_size_field("rect", height_field))
+                elif item.model.height <= 0:
+                    item.set_height(item.model.radius)
             item.sync_from_model()
 
         if x_value is not None and y_value is not None:
@@ -3277,50 +3349,74 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Fill orientation-marker parameterization fields from the current selection."""
         if len(selected) == 1:
             m = selected[0].model
+            shape = normalize_contact_shape(m.shape, DEFAULT_MARKER_SHAPE)
+            self._set_shape_combo(self.marker_shape_combo, MARKER_SHAPES, shape, mixed=False)
+            self._set_marker_size_label(shape)
+            self.marker_radius_edit.setText(f"{size_field_from_stored_half(shape, m.radius):.2f}")
+            half_h = effective_half_height(shape, m.radius, m.height)
+            self.marker_height_edit.setText(f"{size_field_from_stored_half('rect', half_h):.2f}")
+            self._set_height_row_visible(
+                self._marker_form,
+                self.marker_height_label,
+                self.marker_height_edit,
+                shape_uses_height(shape),
+            )
             self.marker_id_edit.setText(str(m.marker_id))
-            self.marker_side_edit.setText(f"{m.side:.2f}")
             self.marker_x_edit.setText(f"{m.x:.2f}")
             self.marker_y_edit.setText(f"{m.y:.2f}")
-            self._set_label_position_combo(
-                self.marker_label_position_combo, m.label_position, mixed=False
-            )
-            self._set_label_orientation_combo(
-                self.marker_label_orientation_combo, m.label_orientation, mixed=False
-            )
             return
 
         if len(selected) > 1:
-            sides = [it.model.side for it in selected]
+            sizes = [size_field_from_stored_half(it.model.shape, it.model.radius) for it in selected]
             marker_ids = [it.model.marker_id for it in selected]
+            shapes = [normalize_contact_shape(it.model.shape, DEFAULT_MARKER_SHAPE) for it in selected]
+            mixed_shape = not all(s == shapes[0] for s in shapes)
+            common_shape = shapes[0] if not mixed_shape else DEFAULT_MARKER_SHAPE
+            self._set_shape_combo(self.marker_shape_combo, MARKER_SHAPES, common_shape, mixed=mixed_shape)
+            if mixed_shape:
+                self._marker_size_shape = MIXED_SHAPE_LABEL
+                self.marker_size_label.setText("Size")
+            else:
+                self._set_marker_size_label(common_shape)
+            self.marker_radius_edit.setText(f"{sizes[0]:.2f}" if max(sizes) - min(sizes) < 1e-9 else "")
+            if not mixed_shape and shape_uses_height(common_shape):
+                heights = [
+                    size_field_from_stored_half(
+                        "rect",
+                        effective_half_height(it.model.shape, it.model.radius, it.model.height),
+                    )
+                    for it in selected
+                ]
+                self.marker_height_edit.setText(
+                    f"{heights[0]:.2f}" if max(heights) - min(heights) < 1e-9 else ""
+                )
+            else:
+                self.marker_height_edit.setText("")
+            self._set_height_row_visible(
+                self._marker_form,
+                self.marker_height_label,
+                self.marker_height_edit,
+                (not mixed_shape) and shape_uses_height(common_shape),
+            )
             self.marker_id_edit.setText(
                 str(marker_ids[0]) if all(value == marker_ids[0] for value in marker_ids) else ""
             )
-            self.marker_side_edit.setText(
-                f"{sides[0]:.2f}" if max(sides) - min(sides) < 1e-9 else ""
-            )
             self.marker_x_edit.setText("")
             self.marker_y_edit.setText("")
-            positions = [normalize_label_position(it.model.label_position) for it in selected]
-            mixed_position = not all(p == positions[0] for p in positions)
-            self._set_label_position_combo(
-                self.marker_label_position_combo, positions[0], mixed=mixed_position
-            )
-            orientations = [normalize_label_orientation(it.model.label_orientation) for it in selected]
-            mixed_orientation = not all(o == orientations[0] for o in orientations)
-            self._set_label_orientation_combo(
-                self.marker_label_orientation_combo, orientations[0], mixed=mixed_orientation
-            )
             return
 
-        self.marker_id_edit.setText("")
-        self.marker_side_edit.setText("")
+        self.marker_radius_edit.setText("")
+        self.marker_height_edit.setText("")
         self.marker_x_edit.setText("")
         self.marker_y_edit.setText("")
-        self._set_label_position_combo(
-            self.marker_label_position_combo, DEFAULT_LABEL_POSITION, mixed=False
-        )
-        self._set_label_orientation_combo(
-            self.marker_label_orientation_combo, DEFAULT_LABEL_ORIENTATION, mixed=False
+        self.marker_id_edit.setText("")
+        self._set_shape_combo(self.marker_shape_combo, MARKER_SHAPES, DEFAULT_MARKER_SHAPE, mixed=False)
+        self._set_marker_size_label(DEFAULT_MARKER_SHAPE)
+        self._set_height_row_visible(
+            self._marker_form,
+            self.marker_height_label,
+            self.marker_height_edit,
+            False,
         )
 
 

@@ -1,22 +1,26 @@
 """
 Shared data structures for orientation markers.
 
-An orientation marker is a fabrication / layout fiducial: a white square used
-to read the orientation of the array. It is not an electrode or a pad, is not
-linked to either, and is not a SpikeInterface contact.
+An orientation marker is a fabrication / layout fiducial used to read the
+orientation of the array. It is not an electrode or a pad, is not linked to
+either, and is not a SpikeInterface contact.
 
-It is persisted in native JSON and written to the Excel / analysis workbooks
-(geometry only). SpikeInterface export omits it. Map-label side and rotation
-are native JSON only.
+Geometry uses the same SpikeInterface shapes as electrodes and pads
+(circle, square, rect). It is persisted in native JSON and written to the
+Excel / analysis workbooks. SpikeInterface export omits it. Map-label side
+and rotation are native JSON only.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .contact_shape import CONTACT_SHAPES
 from .electrode import DEFAULT_LABEL_ORIENTATION, DEFAULT_LABEL_POSITION
 
-DEFAULT_MARKER_SIDE = 20.0
+DEFAULT_MARKER_RADIUS = 10.0
+DEFAULT_MARKER_SHAPE = "square"
+MARKER_SHAPES = CONTACT_SHAPES
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +29,9 @@ class OrientationMarkerSnapshot:
 
     x: float
     y: float
-    side: float
+    radius: float
+    height: float
+    shape: str
     label_position: str
     label_orientation: int
 
@@ -37,23 +43,24 @@ class OrientationMarker:
 
     Field groups:
     - identity: marker_id (editor-assigned, like electrode eid / pad_id)
-    - geometry: x, y, side (full square side length)
-    - editor display: label_position (above / below / left / right) and
-      label_orientation (0 / 90 / 180 / 270 degrees)
+    - geometry: x, y, radius, height, shape
 
     Notes:
-    - shape is always a square; there is no SpikeInterface contact shape.
-    - side is the full extent (not a stored half-width).
+    - shape is a SpikeInterface contact shape: circle, square, or rect.
+    - radius is the stored half-extent along X (true radius for a circle).
+    - height is the stored half-extent along Y for rect; 0 means use radius.
     - There is no electrode or pad association.
-    - The marker ID is drawn next to the square. label_position and
-      label_orientation are editor display only (native JSON); they are
-      omitted from SpikeInterface and XLSX.
+    - No map label is drawn. label_position and label_orientation are kept
+      for native JSON compatibility with older files; they are omitted from
+      SpikeInterface and XLSX.
     """
 
     marker_id: int
     x: float
     y: float
-    side: float = DEFAULT_MARKER_SIDE
+    radius: float = DEFAULT_MARKER_RADIUS
+    height: float = 0.0
+    shape: str = DEFAULT_MARKER_SHAPE
     label_position: str = DEFAULT_LABEL_POSITION
     label_orientation: int = DEFAULT_LABEL_ORIENTATION
 
@@ -62,7 +69,9 @@ class OrientationMarker:
         return OrientationMarkerSnapshot(
             x=self.x,
             y=self.y,
-            side=self.side,
+            radius=self.radius,
+            height=self.height,
+            shape=self.shape,
             label_position=self.label_position,
             label_orientation=self.label_orientation,
         )
@@ -71,7 +80,9 @@ class OrientationMarker:
         """Apply a snapshot onto this model (keeps marker_id)."""
         self.x = snap.x
         self.y = snap.y
-        self.side = snap.side
+        self.radius = snap.radius
+        self.height = snap.height
+        self.shape = snap.shape
         self.label_position = snap.label_position
         self.label_orientation = snap.label_orientation
 
@@ -82,11 +93,9 @@ class OrientationMarker:
             marker_id=marker_id,
             x=snap.x,
             y=snap.y,
-            side=snap.side,
+            radius=snap.radius,
+            height=snap.height,
+            shape=snap.shape,
             label_position=snap.label_position,
             label_orientation=snap.label_orientation,
         )
-
-    def half_side(self) -> float:
-        """Half-extent used for drawing and bounds."""
-        return self.side / 2.0

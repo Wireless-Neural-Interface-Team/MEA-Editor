@@ -178,7 +178,34 @@ class IoRoundTripTests(unittest.TestCase):
         self.assertEqual(document.electrodes[0].label_position, "below")
         self.assertEqual(document.electrodes[0].label_orientation, 0)
 
-    def test_empty_map_labels_are_preserved(self) -> None:
+    def test_legacy_orientation_marker_side_becomes_square(self) -> None:
+        payload = {
+            "specification": NATIVE_SPECIFICATION,
+            "version": "1.10",
+            "si_units": "um",
+            "electrodes": [
+                {
+                    "eid": 1,
+                    "x": 0.0,
+                    "y": 0.0,
+                    "potentiostat_id": 0,
+                    "intan_id": "A-000",
+                }
+            ],
+            "orientation_markers": [
+                {"marker_id": 3, "x": 8.0, "y": 9.0, "side": 24.0},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "legacy_marker.json")
+            Path(path).write_text(json.dumps(payload), encoding="utf-8")
+            document = load_array_document(path)
+        self.assertEqual(len(document.orientation_markers), 1)
+        marker = document.orientation_markers[0]
+        self.assertEqual(marker.marker_id, 3)
+        self.assertEqual(marker.shape, "square")
+        self.assertEqual(marker.radius, 12.0)
+        self.assertEqual(marker.height, 0.0)
         electrodes, pads, schema = _sample_array()
         with tempfile.TemporaryDirectory() as tmp:
             path = str(Path(tmp) / "array.json")
@@ -482,8 +509,8 @@ class IoRoundTripTests(unittest.TestCase):
     def test_orientation_markers_roundtrip_and_xlsx_only(self) -> None:
         electrodes, pads, schema = _sample_array()
         markers = [
-            OrientationMarker(marker_id=2, x=-50.0, y=80.0, side=30.0),
-            OrientationMarker(marker_id=0, x=100.0, y=-10.0, side=12.0),
+            OrientationMarker(marker_id=2, x=-50.0, y=80.0, radius=15.0, shape="square"),
+            OrientationMarker(marker_id=0, x=100.0, y=-10.0, radius=6.0, shape="circle"),
         ]
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             native_path = str(Path(tmp) / "array.json")
@@ -503,13 +530,17 @@ class IoRoundTripTests(unittest.TestCase):
                 [item["marker_id"] for item in payload["orientation_markers"]],
                 [0, 2],
             )
-            self.assertEqual(payload["orientation_markers"][1]["side"], 30.0)
+            self.assertEqual(payload["orientation_markers"][1]["radius"], 15.0)
+            self.assertEqual(payload["orientation_markers"][1]["shape"], "square")
+            self.assertNotIn("side", payload["orientation_markers"][1])
             self.assertEqual(payload["orientation_markers"][1]["label_position"], "below")
             self.assertEqual(payload["orientation_markers"][1]["label_orientation"], 0)
             document = load_array_document(native_path)
             self.assertEqual([m.marker_id for m in document.orientation_markers], [0, 2])
             self.assertEqual(document.orientation_markers[1].x, -50.0)
-            self.assertEqual(document.orientation_markers[1].side, 30.0)
+            self.assertEqual(document.orientation_markers[1].radius, 15.0)
+            self.assertEqual(document.orientation_markers[1].shape, "square")
+            self.assertEqual(document.orientation_markers[0].shape, "circle")
 
             export_spikeinterface_json(
                 si_path,
@@ -547,13 +578,16 @@ class IoRoundTripTests(unittest.TestCase):
                 sheet = analysis["orientation_markers"]
                 self.assertEqual(
                     [cell.value for cell in sheet[1]],
-                    ["marker_id", "x", "y", "side"],
+                    ["marker_id", "x", "y", "shape", "radius", "width", "height"],
                 )
                 self.assertEqual(sheet["A2"].value, 0)
                 self.assertEqual(sheet["B2"].value, 100.0)
-                self.assertEqual(sheet["D2"].value, 12.0)
+                self.assertEqual(sheet["D2"].value, "circle")
+                self.assertEqual(sheet["E2"].value, 6.0)
                 self.assertEqual(sheet["A3"].value, 2)
-                self.assertEqual(sheet["D3"].value, 30.0)
+                self.assertEqual(sheet["D3"].value, "square")
+                self.assertEqual(sheet["F3"].value, 30.0)
+                self.assertEqual(sheet["G3"].value, 30.0)
             finally:
                 analysis.close()
 
@@ -579,7 +613,9 @@ class IoRoundTripTests(unittest.TestCase):
                 marker_id=0,
                 x=5.0,
                 y=6.0,
-                side=16.0,
+                radius=8.0,
+                height=4.0,
+                shape="rect",
                 label_position="above",
                 label_orientation=180,
             ),
@@ -671,7 +707,7 @@ class VersionTests(unittest.TestCase):
         self.assertTrue(all(part.isdigit() for part in parts))
 
     def test_native_format_version(self) -> None:
-        self.assertEqual(NATIVE_VERSION, "1.10")
+        self.assertEqual(NATIVE_VERSION, "1.11")
 
     def test_version_module_matches_package(self) -> None:
         from mea_editor._version import __version__ as raw

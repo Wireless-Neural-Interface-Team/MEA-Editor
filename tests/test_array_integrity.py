@@ -34,14 +34,14 @@ class UniqueIdTests(unittest.TestCase):
 class UniqueMarkerIdTests(unittest.TestCase):
     def test_duplicate_marker_id_keeps_first(self) -> None:
         markers = [
-            OrientationMarker(marker_id=0, x=0.0, y=0.0, side=20.0),
-            OrientationMarker(marker_id=0, x=10.0, y=0.0, side=12.0),
+            OrientationMarker(marker_id=0, x=0.0, y=0.0, radius=10.0),
+            OrientationMarker(marker_id=0, x=10.0, y=0.0, radius=6.0),
         ]
         changes = ensure_unique_marker_ids(markers)
         self.assertEqual(changes, 1)
         self.assertEqual(markers[0].marker_id, 0)
         self.assertEqual(markers[1].marker_id, 1)
-        self.assertEqual(markers[1].side, 12.0)
+        self.assertEqual(markers[1].radius, 6.0)
 
 
 class StatusFlagTests(unittest.TestCase):

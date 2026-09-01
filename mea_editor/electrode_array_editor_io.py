@@ -69,7 +69,8 @@ from .electrode import (
     normalize_label_position,
 )
 from .orientation_marker import (
-    DEFAULT_MARKER_SIDE,
+    DEFAULT_MARKER_RADIUS,
+    DEFAULT_MARKER_SHAPE,
     OrientationMarker,
 )
 from .pad import (
@@ -78,7 +79,7 @@ from .pad import (
 )
 
 NATIVE_SPECIFICATION = "mea_editor"
-NATIVE_VERSION = "1.10"
+NATIVE_VERSION = "1.11"
 MIN_RADIUS = 0.001
 DEFAULT_UNITS = "um"
 PROBEINTERFACE_SPEC = "probeinterface"
@@ -629,14 +630,32 @@ def _load_pads_from_payload(data: dict[str, Any]) -> list[Pad]:
 
 
 def _orientation_marker_from_native_dict(raw: dict[str, Any], fallback_index: int) -> OrientationMarker:
-    """Build an OrientationMarker from a native JSON object."""
+    """Build an OrientationMarker from a native JSON object.
+
+    Current files store `shape` / `radius` / `height` like pads. Older files
+    stored a square `side` (full extent); that is converted to a square with
+    `radius = side / 2`.
+    """
     marker_id = _as_int(raw.get("marker_id"), fallback_index)
-    side = max(_as_float(raw.get("side"), DEFAULT_MARKER_SIDE), MIN_RADIUS)
+    if "radius" in raw:
+        shape = normalize_contact_shape(
+            _as_str(raw.get("shape"), DEFAULT_MARKER_SHAPE),
+            DEFAULT_MARKER_SHAPE,
+        )
+        radius = max(_as_float(raw.get("radius"), DEFAULT_MARKER_RADIUS), MIN_RADIUS)
+        height = max(_as_float(raw.get("height"), 0.0), 0.0)
+    else:
+        side = max(_as_float(raw.get("side"), DEFAULT_MARKER_RADIUS * 2.0), MIN_RADIUS)
+        shape = DEFAULT_MARKER_SHAPE
+        radius = max(side / 2.0, MIN_RADIUS)
+        height = 0.0
     return OrientationMarker(
         marker_id=marker_id,
         x=_as_float(raw.get("x"), 0.0),
         y=_as_float(raw.get("y"), 0.0),
-        side=side,
+        radius=radius,
+        height=height,
+        shape=shape,
         label_position=normalize_label_position(raw.get("label_position", DEFAULT_LABEL_POSITION)),
         label_orientation=normalize_label_orientation(
             raw.get("label_orientation", DEFAULT_LABEL_ORIENTATION)
@@ -802,7 +821,9 @@ def _orientation_marker_to_native_dict(model: OrientationMarker) -> dict[str, An
         "marker_id": int(model.marker_id),
         "x": float(model.x),
         "y": float(model.y),
-        "side": max(float(model.side), MIN_RADIUS),
+        "radius": max(float(model.radius), MIN_RADIUS),
+        "height": max(float(model.height), 0.0),
+        "shape": str(model.shape or DEFAULT_MARKER_SHAPE),
         "label_position": normalize_label_position(model.label_position),
         "label_orientation": normalize_label_orientation(model.label_orientation),
     }
@@ -1063,16 +1084,20 @@ def _resolved_schema(
 
 
 def _write_orientation_marker_sheet(workbook, orientation_markers: list[OrientationMarker] | None) -> None:
-    """Add an orientation_markers sheet (id, x, y, side). Always created."""
+    """Add an orientation_markers sheet (id, x, y, shape, sizes). Always created."""
     sheet = workbook.create_sheet("orientation_markers")
-    sheet.append(["marker_id", "x", "y", "side"])
+    sheet.append(["marker_id", "x", "y", "shape", "radius", "width", "height"])
     for marker in sorted(orientation_markers or [], key=lambda item: item.marker_id):
+        radius, width, height = export_contact_sizes(marker.shape, marker.radius, marker.height)
         sheet.append(
             [
                 int(marker.marker_id),
                 float(marker.x),
                 float(marker.y),
-                max(float(marker.side), MIN_RADIUS),
+                str(marker.shape or DEFAULT_MARKER_SHAPE),
+                radius,
+                width,
+                height,
             ]
         )
 
@@ -1100,7 +1125,8 @@ def export_analysis_xlsx(
     (`pad_id`, `pad_x`, `pad_y`, `pad_shape`).
 
     Orientation markers are written on a separate `orientation_markers` sheet
-    (`marker_id`, `x`, `y`, `side`). They are not SpikeInterface contacts.
+    (`marker_id`, `x`, `y`, `shape`, `radius`, `width`, `height`). They are
+    not SpikeInterface contacts.
 
     `channel` is the Potentiostat ID, not the SpikeInterface channel.
     """

@@ -45,7 +45,7 @@ class SelectionOverlayTests(unittest.TestCase):
         scene.addItem(pad_item)
         pad_item.setSelected(True)
 
-        marker = OrientationMarker(marker_id=1, x=20.0, y=0.0, side=16.0)
+        marker = OrientationMarker(marker_id=1, x=20.0, y=0.0, radius=8.0)
         marker_item = OrientationMarkerView(marker, lambda: None, lambda: None)
         scene.addItem(marker_item)
         marker_item.setSelected(True)
