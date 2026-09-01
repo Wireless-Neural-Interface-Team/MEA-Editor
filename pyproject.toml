@@ -1,10 +1,11 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mea_editor*"]
+exclude = ["tests*", "si_env*", ".venv*"]
 
 [tool.setuptools.dynamic]
 version = {attr = "mea_editor._version.__version__"}
@@ -14,7 +15,8 @@ name = "mea_editor"
 dynamic = ["version"]
 description = "GUI and library to create and modify MEA (Multi-Electrode Arrays), with optional SpikeInterface export"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     {name = "Wireless Neural Interface Team"},
@@ -23,13 +25,13 @@ authors = [
 keywords = ["MEA", "electrode", "spikeinterface", "neuroscience", "electrophysiology"]
 classifiers = [
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Medical Science Apps.",
 ]
 dependencies = [
@@ -49,6 +51,7 @@ build = [
 [project.urls]
 Homepage = "https://github.com/Wireless-Neural-Interface-Team/mea_editor"
 Repository = "https://github.com/Wireless-Neural-Interface-Team/mea_editor"
+Issues = "https://github.com/Wireless-Neural-Interface-Team/mea_editor/issues"
 
 [project.scripts]
 mea-editor = "mea_editor.electrode_array_editor_qt:run_app"
