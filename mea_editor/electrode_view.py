@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Callable
 
 try:
-    from PySide6.QtGui import QColor, QPainterPath, QTransform
+    from PySide6.QtGui import QColor, QPainterPath, QPen, QTransform
     from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem
 except ImportError as exc:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from exc
@@ -50,6 +50,7 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
         self._on_change = on_change
         self._on_selection_change = on_selection_change
         self._map_labels = map_labels
+        self._is_add_target = False
         # ItemSendsGeometryChanges required for ItemPositionHasChanged in itemChange.
         self.setFlags(
             QGraphicsItem.ItemIsSelectable
@@ -104,12 +105,28 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
         if hasattr(self, "_view_labels"):
             self._layout_labels()
 
+    def set_add_target(self, enabled: bool) -> None:
+        """Yellow highlight for the electrode that a new pad will be linked to."""
+        enabled = bool(enabled)
+        if self._is_add_target == enabled:
+            return
+        self._is_add_target = enabled
+        self._refresh_style()
+
     def _refresh_style(self) -> None:
         """
         Apply fill and outline colors based on state.
 
-        Priority: duplicate (red) > selected (yellow) > color by shank.
+        Priority: add-pad target (yellow) > pairing/duplicate (red) > selected
+        (yellow) > color by shank. The add-pad target must win over red: the
+        electrode that still needs a pad is exactly the one shown as unpaired.
         """
+        if self._is_add_target:
+            apply_contact_colors(self, QColor("#ffd447"), QColor("#ffffff"))
+            self.setPen(QPen(QColor("#ffffff"), 4))
+            self.setZValue(20)
+            return
+        self.setZValue(10)
         is_duplicate = self.model.has_any_duplicate()
         if is_duplicate:
             apply_contact_colors(self, QColor("#d44b4b"), QColor("#ffe0e0"))

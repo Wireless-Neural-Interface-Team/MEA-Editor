@@ -66,17 +66,41 @@ class ViewScopedTextItem(QGraphicsSimpleTextItem):
     ItemIgnoresTransformations, so screen size is correct for a single zoom.
     Each contact keeps one copy per camera; this item paints only in its home
     view so the other camera can keep an independently positioned copy.
+
+    Outside labels invert against the pixels already drawn, so the same
+    glyph is light on the dark canvas and dark on a white orientation marker.
     """
 
-    def __init__(self, text: str = "", parent=None, view_attr: str = "") -> None:
+    def __init__(
+        self,
+        text: str = "",
+        parent=None,
+        view_attr: str = "",
+        contrast_on_markers: bool = False,
+    ) -> None:
         super().__init__(text, parent)
         self._view_attr = view_attr
+        self._contrast_on_markers = contrast_on_markers
         self.setAcceptedMouseButtons(Qt.NoButton)
 
     def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
         if widget is not None and not self._is_home_viewport(widget):
             return
-        super().paint(painter, _option_without_qt_selection(option), widget)
+        if not self._contrast_on_markers:
+            super().paint(painter, _option_without_qt_selection(option), widget)
+            return
+        # Draw the glyphs ourselves so CompositionMode_Difference is not
+        # reset by QGraphicsSimpleTextItem. White ink inverts against pixels
+        # already in the view: dark on a white marker, light on the canvas.
+        painter.setCompositionMode(QPainter.CompositionMode_Difference)
+        painter.setFont(self.font())
+        painter.setPen(QPen(QColor("#ffffff"), 0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawText(
+            self.boundingRect(),
+            int(Qt.AlignLeft | Qt.AlignTop | Qt.TextDontClip),
+            self.text(),
+        )
 
     def _is_home_viewport(self, widget) -> bool:
         scene = self.scene()
@@ -94,8 +118,16 @@ class ViewScopedTextItem(QGraphicsSimpleTextItem):
         return False
 
 
-def _make_scoped_label(parent, view_attr: str, font: QFont, color: str) -> ViewScopedTextItem:
-    item = ViewScopedTextItem("", parent, view_attr)
+def _make_scoped_label(
+    parent,
+    view_attr: str,
+    font: QFont,
+    color: str,
+    contrast_on_markers: bool = False,
+) -> ViewScopedTextItem:
+    item = ViewScopedTextItem(
+        "", parent, view_attr, contrast_on_markers=contrast_on_markers
+    )
     item.setBrush(QBrush(QColor(color)))
     item.setFont(font)
     item.setTransform(QTransform.fromScale(1.0, 1.0))
@@ -109,7 +141,9 @@ class ViewLabelPair:
     def __init__(self, parent, view_attr: str, font: QFont) -> None:
         self.view_attr = view_attr
         self.center = _make_scoped_label(parent, view_attr, font, "#e9edf2")
-        self.below = _make_scoped_label(parent, view_attr, font, "#ffffff")
+        self.below = _make_scoped_label(
+            parent, view_attr, font, "#ffffff", contrast_on_markers=True
+        )
 
     def set_text(self, center: str, below: str) -> None:
         self.center.setText(center)
@@ -234,22 +268,25 @@ class ElectrodeArrayView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._is_add_mode = lambda: False
         self._add_at = lambda x, y: None
+        self._cancel_add = lambda: None
         self._on_delete = lambda: None
         self._on_view_transform_changed = lambda view=None: None
         self._on_activated = lambda: None
         self._is_middle_panning = False
         self._last_pan_pos = None
 
-    def set_add_callbacks(self, is_add_mode, add_at) -> None:
+    def set_add_callbacks(self, is_add_mode, add_at, cancel_add=None) -> None:
         """
-        Register callbacks for add-point mode (electrode or pad).
+        Register callbacks for add-point mode (electrode, pad, or marker).
 
         Args:
             is_add_mode: Function returning True if add mode is active.
             add_at: Function(x, y) creating a point at the given position.
+            cancel_add: Function leaving add mode (Escape).
         """
         self._is_add_mode = is_add_mode
         self._add_at = add_at
+        self._cancel_add = cancel_add or (lambda: None)
 
     def set_delete_callback(self, on_delete) -> None:
         """
@@ -390,6 +427,10 @@ class ElectrodeArrayView(QGraphicsView):
         """
         Handle Suppr/Backspace to delete selected electrodes when view has focus.
         """
+        if event.key() == Qt.Key_Escape and self._is_add_mode():
+            self._cancel_add()
+            event.accept()
+            return
         if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
             self._on_delete()
             event.accept()

@@ -39,7 +39,9 @@ try:
         QFileDialog,
         QFormLayout,
         QFrame,
+        QGraphicsItem,
         QGraphicsScene,
+        QGraphicsView,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -255,6 +257,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
         else:
             event.accept()
 
+    def keyPressEvent(self, event) -> None:  # type: ignore[override]
+        """Escape leaves add mode when the window has focus."""
+        if event.key() == Qt.Key_Escape and self._is_adding():
+            self._stop_all_add_modes()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def showEvent(self, event) -> None:  # type: ignore[override]
         """
         On first show: run startup workflow, then fit view once viewport is sized.
@@ -270,8 +280,9 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Build a mapping viewport bound to the shared scene."""
         view = ElectrodeArrayView(self.scene)
         view.set_add_callbacks(
-            lambda: self.is_add_mode or self.is_add_pad_mode or self.is_add_marker_mode,
+            self._is_adding,
             self._add_point_at,
+            self._stop_all_add_modes,
         )
         view.set_delete_callback(self._delete_selected)
         view.set_view_transform_changed_callback(self._refresh_label_layouts)
@@ -324,9 +335,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
         layout.setContentsMargins(4, 0, 0, 0)
         layout.setSpacing(8)
 
-        layout.addWidget(self._build_array_group())
-        layout.addWidget(self._build_map_labels_group())
-        layout.addWidget(self._build_selection_group())
+        self._array_group = self._build_array_group()
+        self._map_labels_group = self._build_map_labels_group()
+        self._selection_group = self._build_selection_group()
+        layout.addWidget(self._array_group)
+        layout.addWidget(self._map_labels_group)
+        layout.addWidget(self._selection_group)
 
         self.point_tabs = QTabWidget()
         self.point_tabs.addTab(self._build_electrode_tab(), "Electrodes")
@@ -369,6 +383,34 @@ class ElectrodeArrayEditorQt(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(inner)
         return scroll
+
+    def _make_add_geometry_fields(
+        self,
+        form: QFormLayout,
+        shapes: tuple[str, ...],
+        default_shape: str,
+        default_radius: float,
+    ) -> tuple[QComboBox, QLabel, QLineEdit, QLabel, QLineEdit]:
+        """Shape and size rows for creating new items (not bound to the selection)."""
+        shape_combo = QComboBox()
+        shape_combo.addItems(list(shapes))
+        shape_combo.setCurrentText(default_shape)
+        shape_combo.setToolTip("Geometry of items created with Add.")
+        size_edit = QLineEdit(f"{size_field_from_stored_half(default_shape, default_radius):.2f}")
+        size_edit.setToolTip(
+            "Size of items created with Add. Radius for circle, side length for square, width for rect."
+        )
+        size_label = QLabel(primary_size_field_label(default_shape))
+        height_edit = QLineEdit(f"{size_field_from_stored_half('rect', default_radius):.2f}")
+        height_edit.setToolTip("Full height of items created with Add (rect only).")
+        height_label = QLabel(height_field_label())
+        form.addRow("Shape", shape_combo)
+        form.addRow(size_label, size_edit)
+        form.addRow(height_label, height_edit)
+        self._set_height_row_visible(
+            form, height_label, height_edit, shape_uses_height(default_shape)
+        )
+        return shape_combo, size_label, size_edit, height_label, height_edit
 
     def _build_array_group(self) -> QGroupBox:
         """File-level settings that do not depend on the current selection."""
@@ -423,7 +465,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         return box
 
     def _build_electrode_tab(self) -> QWidget:
-        """Find, geometry, attributes, then add/delete actions."""
+        """Find, geometry, attributes, then add/delete actions with creation defaults."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(4, 8, 4, 4)
@@ -443,6 +485,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         b_find_attribute.clicked.connect(self._find_by_attributes)
         self.attribute_find_edit.returnPressed.connect(self._find_by_attributes)
         find_form.addRow("Attributes", self._make_row(self.attribute_find_edit, b_find_attribute))
+        self._electrode_find_box = find_box
         layout.addWidget(find_box)
 
         geom_box = QGroupBox("Geometry")
@@ -501,6 +544,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         scroll_layout = QVBoxLayout(scroll_inner)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
         scroll_layout.setSpacing(8)
+        self._electrode_geom_box = geom_box
+        self._electrode_attributes_box = attributes_box
         scroll_layout.addWidget(geom_box)
         scroll_layout.addWidget(attributes_box)
         scroll_layout.addStretch(1)
@@ -508,7 +553,37 @@ class ElectrodeArrayEditorQt(QMainWindow):
         layout.addWidget(self.b_apply_edits)
 
         tools = QGroupBox("Actions")
+        tools.setToolTip(
+            "Defaults for newly created electrodes. Independent of the current selection."
+        )
         tools_form = self._form_layout(tools)
+        self._add_electrode_actions_form = tools_form
+        (
+            self.add_electrode_shape_combo,
+            self.add_electrode_size_label,
+            self.add_electrode_size_edit,
+            self.add_electrode_height_label,
+            self.add_electrode_height_edit,
+        ) = self._make_add_geometry_fields(
+            tools_form,
+            ELECTRODE_SHAPES,
+            DEFAULT_SHAPE,
+            DEFAULT_RADIUS,
+        )
+        self._add_electrode_size_shape = DEFAULT_SHAPE
+        self.add_electrode_shape_combo.currentTextChanged.connect(
+            self._on_add_electrode_shape_changed
+        )
+        self.add_electrode_label_position_combo = self._make_label_position_combo()
+        self.add_electrode_label_orientation_combo = self._make_label_orientation_combo()
+        self.add_electrode_label_position_combo.setToolTip(
+            "Map-label side of electrodes created with Add. Independent of the current selection."
+        )
+        self.add_electrode_label_orientation_combo.setToolTip(
+            "Map-label rotation of electrodes created with Add. Independent of the current selection."
+        )
+        tools_form.addRow("Label position", self.add_electrode_label_position_combo)
+        tools_form.addRow("Label orientation", self.add_electrode_label_orientation_combo)
         self.b_add_electrode = QPushButton("Add Electrode")
         self.b_add_electrode.setCheckable(True)
         self.b_add_electrode.setAutoDefault(False)
@@ -518,11 +593,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
         b_delete.clicked.connect(self._delete_selected_electrodes)
         tools_form.addRow(self.b_add_electrode)
         tools_form.addRow(b_delete)
+        self._electrode_actions_box = tools
         layout.addWidget(tools)
         return tab
 
     def _build_pad_tab(self) -> QWidget:
-        """Find, properties, then add/delete actions."""
+        """Find, properties, then add/delete actions with creation defaults."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(4, 8, 4, 4)
@@ -538,6 +614,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         b_find_pad.clicked.connect(self._find_by_pad_id)
         self.pad_id_find_edit.returnPressed.connect(self._find_by_pad_id)
         find_form.addRow("Pad ID", self._make_row(self.pad_id_find_edit, b_find_pad))
+        self._pad_find_box = find_box
         layout.addWidget(find_box)
 
         pad_edit_box = QGroupBox("Properties")
@@ -584,13 +661,42 @@ class ElectrodeArrayEditorQt(QMainWindow):
         scroll_layout = QVBoxLayout(scroll_inner)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
         scroll_layout.setSpacing(8)
+        self._pad_edit_box = pad_edit_box
         scroll_layout.addWidget(pad_edit_box)
         scroll_layout.addStretch(1)
         layout.addWidget(self._scroll_area(scroll_inner), stretch=1)
         layout.addWidget(self.b_apply_pad_edits)
 
         tools = QGroupBox("Actions")
+        tools.setToolTip(
+            "Defaults for newly created pads. Independent of the current selection."
+        )
         tools_form = self._form_layout(tools)
+        self._add_pad_actions_form = tools_form
+        (
+            self.add_pad_shape_combo,
+            self.add_pad_size_label,
+            self.add_pad_size_edit,
+            self.add_pad_height_label,
+            self.add_pad_height_edit,
+        ) = self._make_add_geometry_fields(
+            tools_form,
+            PAD_SHAPES,
+            DEFAULT_PAD_SHAPE,
+            DEFAULT_PAD_RADIUS,
+        )
+        self._add_pad_size_shape = DEFAULT_PAD_SHAPE
+        self.add_pad_shape_combo.currentTextChanged.connect(self._on_add_pad_shape_changed)
+        self.add_pad_label_position_combo = self._make_label_position_combo()
+        self.add_pad_label_orientation_combo = self._make_label_orientation_combo()
+        self.add_pad_label_position_combo.setToolTip(
+            "Map-label side of pads created with Add. Independent of the current selection."
+        )
+        self.add_pad_label_orientation_combo.setToolTip(
+            "Map-label rotation of pads created with Add. Independent of the current selection."
+        )
+        tools_form.addRow("Label position", self.add_pad_label_position_combo)
+        tools_form.addRow("Label orientation", self.add_pad_label_orientation_combo)
         self.pad_add_electrode_combo = QComboBox()
         self.pad_add_electrode_combo.setMaxVisibleItems(20)
         self.b_add_pad = QPushButton("Add Pad")
@@ -603,11 +709,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
         tools_form.addRow("Electrode for new pad", self.pad_add_electrode_combo)
         tools_form.addRow(self.b_add_pad)
         tools_form.addRow(b_delete_pad)
+        self._pad_actions_box = tools
         layout.addWidget(tools)
         return tab
 
     def _build_marker_tab(self) -> QWidget:
-        """Find, properties, then add/delete actions for orientation markers."""
+        """Find, properties, then add/delete actions with creation defaults."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(4, 8, 4, 4)
@@ -623,6 +730,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         b_find_marker.clicked.connect(self._find_by_marker_id)
         self.marker_id_find_edit.returnPressed.connect(self._find_by_marker_id)
         find_form.addRow("Marker ID", self._make_row(self.marker_id_find_edit, b_find_marker))
+        self._marker_find_box = find_box
         layout.addWidget(find_box)
 
         marker_edit_box = QGroupBox("Properties")
@@ -663,13 +771,33 @@ class ElectrodeArrayEditorQt(QMainWindow):
         scroll_layout = QVBoxLayout(scroll_inner)
         scroll_layout.setContentsMargins(0, 0, 0, 0)
         scroll_layout.setSpacing(8)
+        self._marker_edit_box = marker_edit_box
         scroll_layout.addWidget(marker_edit_box)
         scroll_layout.addStretch(1)
         layout.addWidget(self._scroll_area(scroll_inner), stretch=1)
         layout.addWidget(self.b_apply_marker_edits)
 
         tools = QGroupBox("Actions")
+        tools.setToolTip(
+            "Defaults for newly created orientation markers. Independent of the current selection. "
+            "Markers have no map label."
+        )
         tools_form = self._form_layout(tools)
+        self._add_marker_actions_form = tools_form
+        (
+            self.add_marker_shape_combo,
+            self.add_marker_size_label,
+            self.add_marker_size_edit,
+            self.add_marker_height_label,
+            self.add_marker_height_edit,
+        ) = self._make_add_geometry_fields(
+            tools_form,
+            MARKER_SHAPES,
+            DEFAULT_MARKER_SHAPE,
+            DEFAULT_MARKER_RADIUS,
+        )
+        self._add_marker_size_shape = DEFAULT_MARKER_SHAPE
+        self.add_marker_shape_combo.currentTextChanged.connect(self._on_add_marker_shape_changed)
         self.b_add_marker = QPushButton("Add Orientation Marker")
         self.b_add_marker.setCheckable(True)
         self.b_add_marker.setAutoDefault(False)
@@ -679,6 +807,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         b_delete_marker.clicked.connect(self._delete_selected_markers)
         tools_form.addRow(self.b_add_marker)
         tools_form.addRow(b_delete_marker)
+        self._marker_actions_box = tools
         layout.addWidget(tools)
         return tab
 
@@ -763,9 +892,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
             "Middle-drag: pan the view\n"
             "Wheel: zoom\n"
             "Move: X/Y on one item, or dX/dY on the selection\n"
-            "Add Electrode: click the scene\n"
-            "Add Pad: choose an electrode, then click the scene\n"
-            "Add Orientation Marker: click the scene (no link required)\n"
+            "Add Electrode: set shape/size/label in Actions, then click the scene\n"
+            "Add Pad: set shape/size/label in Actions, choose an electrode, then click the scene\n"
+            "Add Orientation Marker: set shape/size in Actions, then click the scene\n"
+            "Escape: leave add mode\n"
             "Delete / Backspace: delete selected\n"
             "Ctrl+Z / Ctrl+Y: undo / redo\n"
             "Ctrl+0: fit both mapping views (electrodes and pads)\n"
@@ -805,7 +935,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def _on_scene_selection_changed(self) -> None:
         """Keep associated pads and electrodes selected together, then refresh the panel."""
-        if self._is_mutating_scene:
+        if self._is_mutating_scene or self._is_adding():
             return
         self._sync_associated_selection()
         self._refresh_panel_values()
@@ -907,7 +1037,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def _select_from_electrode_table(self, eids: list[int]) -> None:
         """Select table-chosen electrodes in both mapping views (pads follow)."""
-        if self._is_syncing_selection or self._is_restoring_state:
+        if self._is_syncing_selection or self._is_restoring_state or self._is_adding():
             return
         matches = [self.items[eid] for eid in eids if eid in self.items]
         self.scene.clearSelection()
@@ -1233,6 +1363,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.scene.addItem(item)
         self.electrodes[model.eid] = model
         self.items[model.eid] = item
+        item.setFlag(QGraphicsItem.ItemIsSelectable, not self._is_adding())
         item._layout_labels()
         return item
 
@@ -1249,6 +1380,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.scene.addItem(item.link_item)
         self.pads[pad.pad_id] = pad
         self.pad_items[pad.pad_id] = item
+        item.setFlag(QGraphicsItem.ItemIsSelectable, not self._is_adding())
         item.update_link()
         item._layout_labels()
         return item
@@ -1263,6 +1395,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.scene.addItem(item)
         self.orientation_markers[marker.marker_id] = marker
         self.marker_items[marker.marker_id] = item
+        item.setFlag(QGraphicsItem.ItemIsSelectable, not self._is_adding())
         return item
 
     def _set_electrodes(self, models: list[Electrode]) -> None:
@@ -1459,6 +1592,111 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._marker_size_shape = shape
         self.marker_size_label.setText(primary_size_field_label(shape))
 
+    def _apply_add_shape_change(
+        self,
+        shape: str,
+        default_shape: str,
+        old_shape: str,
+        size_edit: QLineEdit,
+        size_label: QLabel,
+        height_label: QLabel,
+        height_edit: QLineEdit,
+        form: QFormLayout,
+    ) -> str:
+        """Convert add-mode size fields for a new shape and return the normalized shape."""
+        shape = normalize_contact_shape(shape, default_shape)
+        stored = self._convert_size_edit(size_edit, old_shape, shape)
+        if shape_uses_height(shape):
+            if stored is not None:
+                height_edit.setText(f"{size_field_from_stored_half('rect', stored):.2f}")
+            elif not height_edit.text().strip():
+                height_edit.setText(size_edit.text())
+        size_label.setText(primary_size_field_label(shape))
+        self._set_height_row_visible(form, height_label, height_edit, shape_uses_height(shape))
+        return shape
+
+    def _on_add_electrode_shape_changed(self, shape: str) -> None:
+        """Keep add-electrode size fields in sync with the chosen geometry."""
+        self._add_electrode_size_shape = self._apply_add_shape_change(
+            shape,
+            DEFAULT_SHAPE,
+            self._add_electrode_size_shape,
+            self.add_electrode_size_edit,
+            self.add_electrode_size_label,
+            self.add_electrode_height_label,
+            self.add_electrode_height_edit,
+            self._add_electrode_actions_form,
+        )
+
+    def _on_add_pad_shape_changed(self, shape: str) -> None:
+        """Keep add-pad size fields in sync with the chosen geometry."""
+        self._add_pad_size_shape = self._apply_add_shape_change(
+            shape,
+            DEFAULT_PAD_SHAPE,
+            self._add_pad_size_shape,
+            self.add_pad_size_edit,
+            self.add_pad_size_label,
+            self.add_pad_height_label,
+            self.add_pad_height_edit,
+            self._add_pad_actions_form,
+        )
+
+    def _on_add_marker_shape_changed(self, shape: str) -> None:
+        """Keep add-marker size fields in sync with the chosen geometry."""
+        self._add_marker_size_shape = self._apply_add_shape_change(
+            shape,
+            DEFAULT_MARKER_SHAPE,
+            self._add_marker_size_shape,
+            self.add_marker_size_edit,
+            self.add_marker_size_label,
+            self.add_marker_height_label,
+            self.add_marker_height_edit,
+            self._add_marker_actions_form,
+        )
+
+    @staticmethod
+    def _geometry_from_add_fields(
+        shape_combo: QComboBox,
+        size_edit: QLineEdit,
+        height_edit: QLineEdit,
+        default_shape: str,
+        default_radius: float,
+    ) -> tuple[str, float, float]:
+        """Parse (shape, stored radius, stored height) from add-mode widgets."""
+        shape = normalize_contact_shape(shape_combo.currentText(), default_shape)
+        radius = default_radius
+        size_text = size_edit.text().strip()
+        if size_text:
+            try:
+                parsed = float(size_text)
+                if parsed > 0:
+                    radius = stored_half_from_size_field(shape, parsed)
+            except ValueError:
+                pass
+        height = 0.0
+        if shape_uses_height(shape):
+            height_text = height_edit.text().strip()
+            if height_text:
+                try:
+                    parsed_h = float(height_text)
+                    if parsed_h > 0:
+                        height = stored_half_from_size_field("rect", parsed_h)
+                except ValueError:
+                    pass
+            if height <= 0:
+                height = radius
+        return shape, radius, height
+
+    def _label_from_add_fields(
+        self, position_combo: QComboBox, orientation_combo: QComboBox
+    ) -> tuple[str, int]:
+        """Parse label side and rotation from add-mode widgets."""
+        position = self._label_position_from_combo(position_combo) or DEFAULT_LABEL_POSITION
+        orientation = self._label_orientation_from_combo(orientation_combo)
+        if orientation is None:
+            orientation = DEFAULT_LABEL_ORIENTATION
+        return position, orientation
+
     @staticmethod
     def _make_label_position_combo() -> QComboBox:
         """Combo for the editor-only map-label side (native JSON, not exported)."""
@@ -1554,6 +1792,106 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return None
         return int(eid)
 
+    def _is_adding(self) -> bool:
+        """True while one-click electrode, pad, or orientation-marker creation is active."""
+        return self.is_add_mode or self.is_add_pad_mode or self.is_add_marker_mode
+
+    def _active_add_button(self) -> QPushButton | None:
+        """The Stop Adding button for the current add mode, if any."""
+        if self.is_add_pad_mode:
+            return self.b_add_pad
+        if self.is_add_mode:
+            return self.b_add_electrode
+        if self.is_add_marker_mode:
+            return self.b_add_marker
+        return None
+
+    def _stop_all_add_modes(self) -> None:
+        """Leave electrode, pad, and orientation-marker add modes."""
+        if self.b_add_electrode.isChecked():
+            self.b_add_electrode.setChecked(False)
+        if self.b_add_pad.isChecked():
+            self.b_add_pad.setChecked(False)
+        if self.b_add_marker.isChecked():
+            self.b_add_marker.setChecked(False)
+
+    def _set_scene_items_selectable(self, selectable: bool) -> None:
+        """Allow or block click/rubber-band selection on scene contacts."""
+        for item in (*self.items.values(), *self.pad_items.values(), *self.marker_items.values()):
+            item.setFlag(QGraphicsItem.ItemIsSelectable, selectable)
+
+    def _set_inspector_locked(self, locked: bool) -> None:
+        """
+        Disable the inspector, menus, and electrode table while placing a new item.
+
+        Mapping views stay usable. The active Stop Adding button stays clickable.
+        """
+        enabled = not locked
+        for widget in (
+            self._array_group,
+            self._map_labels_group,
+            self._selection_group,
+            self._electrode_find_box,
+            self._electrode_geom_box,
+            self._electrode_attributes_box,
+            self.b_apply_edits,
+            self._pad_find_box,
+            self._pad_edit_box,
+            self.b_apply_pad_edits,
+            self._marker_find_box,
+            self._marker_edit_box,
+            self.b_apply_marker_edits,
+        ):
+            widget.setEnabled(enabled)
+        self.point_tabs.tabBar().setEnabled(enabled)
+        keep = self._active_add_button() if locked else None
+        for group in (
+            self._electrode_actions_box,
+            self._pad_actions_box,
+            self._marker_actions_box,
+        ):
+            for child in group.findChildren(QWidget):
+                stay_on = keep is not None and (child is keep or keep.isAncestorOf(child))
+                child.setEnabled(enabled or stay_on)
+        self.menuBar().setEnabled(enabled)
+        if self._electrode_table_window is not None:
+            self._electrode_table_window.setEnabled(enabled)
+
+    def _update_add_pad_target_highlight(self) -> None:
+        """Highlight the electrode that the next pad will be linked to."""
+        target = self._new_pad_electrode_eid() if self.is_add_pad_mode else None
+        for eid, item in self.items.items():
+            item.set_add_target(eid == target)
+        if target is None or target not in self.items:
+            return
+        item = self.items[target]
+        pad = 40.0
+        self.electrode_view.ensureVisible(
+            item.sceneBoundingRect().adjusted(-pad, -pad, pad, pad), 80, 80
+        )
+
+    def _sync_add_mode_ui(self) -> None:
+        """Cursors, inspector lock, selection block, and pad-target highlight."""
+        adding = self._is_adding()
+        self._sync_add_cursors()
+        self._set_inspector_locked(adding)
+        self._set_scene_items_selectable(not adding)
+        drag = QGraphicsView.NoDrag if adding else QGraphicsView.RubberBandDrag
+        for view in (self.electrode_view, self.pads_map_view):
+            view.setDragMode(drag)
+        if adding:
+            self._is_mutating_scene = True
+            try:
+                self.scene.clearSelection()
+                self._auto_selected_electrode_eids.clear()
+                self._auto_selected_pad_ids.clear()
+            finally:
+                self._is_mutating_scene = False
+        self._update_add_pad_target_highlight()
+        if not adding:
+            self._sync_associated_selection()
+            self._refresh_panel_values()
+
     def _set_add_mode(self, enabled: bool) -> None:
         """Toggle one-click electrode creation mode."""
         self.is_add_mode = enabled
@@ -1563,10 +1901,9 @@ class ElectrodeArrayEditorQt(QMainWindow):
             if self.b_add_marker.isChecked():
                 self.b_add_marker.setChecked(False)
             self.b_add_electrode.setText("Stop Adding")
-            self._sync_add_cursors()
         else:
             self.b_add_electrode.setText("Add Electrode")
-            self._sync_add_cursors()
+        self._sync_add_mode_ui()
 
     def _set_add_pad_mode(self, enabled: bool) -> None:
         """Toggle one-click pad creation mode (electrode chosen from the list)."""
@@ -1594,32 +1931,30 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self.b_add_pad.blockSignals(False)
                 self.is_add_pad_mode = False
                 return
+            self.is_add_pad_mode = True
             if self.b_add_electrode.isChecked():
                 self.b_add_electrode.setChecked(False)
             if self.b_add_marker.isChecked():
                 self.b_add_marker.setChecked(False)
-            self.is_add_pad_mode = True
             self.b_add_pad.setText("Stop Adding")
-            self._sync_add_cursors()
         else:
             self.is_add_pad_mode = False
             self.b_add_pad.setText("Add Pad")
-            self._sync_add_cursors()
+        self._sync_add_mode_ui()
 
     def _set_add_marker_mode(self, enabled: bool) -> None:
         """Toggle one-click orientation-marker creation mode."""
         if enabled:
+            self.is_add_marker_mode = True
             if self.b_add_electrode.isChecked():
                 self.b_add_electrode.setChecked(False)
             if self.b_add_pad.isChecked():
                 self.b_add_pad.setChecked(False)
-            self.is_add_marker_mode = True
             self.b_add_marker.setText("Stop Adding")
-            self._sync_add_cursors()
         else:
             self.is_add_marker_mode = False
             self.b_add_marker.setText("Add Orientation Marker")
-            self._sync_add_cursors()
+        self._sync_add_mode_ui()
 
     def _sync_add_cursors(self) -> None:
         """Show a crosshair on both mapping views while add-mode is active."""
@@ -1640,30 +1975,36 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self._add_electrode_at(x, y)
 
     def _add_electrode_at(self, x: float, y: float) -> None:
-        """Create a new electrode at (x, y) with a unique paired pad, and select it."""
+        """Create a new electrode at (x, y) and select it. No pad is created."""
         before = self._capture_state()
         next_eid = max(self.electrodes.keys(), default=-1) + 1
-        next_pad_id = max(self.pads.keys(), default=-1) + 1
-        orientation = self._label_orientation_from_combo(self.label_orientation_combo)
+        shape, radius, height = self._geometry_from_add_fields(
+            self.add_electrode_shape_combo,
+            self.add_electrode_size_edit,
+            self.add_electrode_height_edit,
+            DEFAULT_SHAPE,
+            DEFAULT_RADIUS,
+        )
+        label_position, label_orientation = self._label_from_add_fields(
+            self.add_electrode_label_position_combo,
+            self.add_electrode_label_orientation_combo,
+        )
         model = Electrode(
             eid=next_eid,
             x=x,
             y=y,
+            radius=radius,
+            height=height,
+            shape=shape,
             potentiostat_id=self._next_unique_potentiostat_id(),
             intan_id=self._next_unique_intan_id(),
-            label_position=self._label_position_from_combo(self.label_position_combo)
-            or DEFAULT_LABEL_POSITION,
-            label_orientation=(
-                DEFAULT_LABEL_ORIENTATION if orientation is None else orientation
-            ),
+            label_position=label_position,
+            label_orientation=label_orientation,
         )
         fill_electrode_extras(model, self.attribute_schema)
-        offset = max(model.radius, DEFAULT_PAD_RADIUS) * 3.0 + 20.0
-        pad = Pad(pad_id=next_pad_id, electrode_eid=next_eid, x=x + offset, y=y)
         self._is_mutating_scene = True
         try:
             item = self._add_electrode_item(model)
-            self._add_pad_item(pad)
         finally:
             self._is_mutating_scene = False
         self._update_duplicate_flags()
@@ -1697,17 +2038,27 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return
         before = self._capture_state()
         next_pad_id = max(self.pads.keys(), default=-1) + 1
-        orientation = self._label_orientation_from_combo(self.pad_label_orientation_combo)
+        shape, radius, height = self._geometry_from_add_fields(
+            self.add_pad_shape_combo,
+            self.add_pad_size_edit,
+            self.add_pad_height_edit,
+            DEFAULT_PAD_SHAPE,
+            DEFAULT_PAD_RADIUS,
+        )
+        label_position, label_orientation = self._label_from_add_fields(
+            self.add_pad_label_position_combo,
+            self.add_pad_label_orientation_combo,
+        )
         pad = Pad(
             pad_id=next_pad_id,
             electrode_eid=target_eid,
             x=x,
             y=y,
-            label_position=self._label_position_from_combo(self.pad_label_position_combo)
-            or DEFAULT_LABEL_POSITION,
-            label_orientation=(
-                DEFAULT_LABEL_ORIENTATION if orientation is None else orientation
-            ),
+            radius=radius,
+            height=height,
+            shape=shape,
+            label_position=label_position,
+            label_orientation=label_orientation,
         )
         self._is_mutating_scene = True
         try:
@@ -1717,10 +2068,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._update_duplicate_flags()
         self._refresh_pad_electrode_combo()
         self._refresh_pad_add_electrode_combo()
-        self.scene.clearSelection()
-        item.setSelected(True)
-        if self._new_pad_electrode_eid() is None and self.is_add_pad_mode:
+        last_free = self._new_pad_electrode_eid() is None
+        if last_free and self.is_add_pad_mode:
             self.b_add_pad.setChecked(False)
+        self.scene.clearSelection()
+        if last_free:
+            item.setSelected(True)
+        else:
+            self._update_add_pad_target_highlight()
         self._on_scene_visuals_changed()
         self._commit_if_changed(before)
 
@@ -1728,33 +2083,13 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Create a new orientation marker at (x, y) and select it."""
         before = self._capture_state()
         next_id = max(self.orientation_markers.keys(), default=-1) + 1
-        shape_text = self.marker_shape_combo.currentText()
-        shape = (
-            DEFAULT_MARKER_SHAPE
-            if shape_text == MIXED_SHAPE_LABEL
-            else normalize_contact_shape(shape_text, DEFAULT_MARKER_SHAPE)
+        shape, radius, height = self._geometry_from_add_fields(
+            self.add_marker_shape_combo,
+            self.add_marker_size_edit,
+            self.add_marker_height_edit,
+            DEFAULT_MARKER_SHAPE,
+            DEFAULT_MARKER_RADIUS,
         )
-        radius = DEFAULT_MARKER_RADIUS
-        size_text = self.marker_radius_edit.text().strip()
-        if size_text:
-            try:
-                parsed = float(size_text)
-                if parsed > 0:
-                    radius = stored_half_from_size_field(shape, parsed)
-            except ValueError:
-                pass
-        height = 0.0
-        if shape_uses_height(shape):
-            height_text = self.marker_height_edit.text().strip()
-            if height_text:
-                try:
-                    parsed_h = float(height_text)
-                    if parsed_h > 0:
-                        height = stored_half_from_size_field("rect", parsed_h)
-                except ValueError:
-                    pass
-            if height <= 0:
-                height = radius
         marker = OrientationMarker(
             marker_id=next_id,
             x=x,
@@ -2839,6 +3174,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         Items selected only because their associated counterpart is selected
         are not deleted on their own. Orientation markers are never auto-selected.
         """
+        if self._is_adding():
+            return
         electrodes = [
             item
             for item in self._selected_electrode_items()

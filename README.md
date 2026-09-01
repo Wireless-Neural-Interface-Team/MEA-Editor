@@ -97,6 +97,14 @@ Each electrode should have exactly one pad. The editor highlights unpaired or sh
 
 The side panel has three parameterization tabs: **Electrodes**, **Pads**, and **Orientation marker**. The electrode table includes a **Pad ID** column for the linked pad.
 
+On each tab, **Actions** sets the defaults for new items (independent of the current selection):
+
+- **Add Electrode**: shape, size, label position, and label orientation. A linked pad is also created, using the pad **Actions** defaults.
+- **Add Pad**: electrode to link, plus shape, size, and label defaults.
+- **Add Orientation Marker**: shape and size (no map label).
+
+Click the add button, then click the scene. **Geometry** / **Properties** still edit the current selection.
+
 ## Orientation marker
 
 An orientation marker is a white fiducial used to read the orientation of the maps. It is not an electrode or a pad: it has no electrical link, does not take part in pairing, and is not a SpikeInterface contact. Shape and size follow the same rules as electrodes and pads (`circle`, `square`, `rect`).
@@ -108,7 +116,7 @@ Fields:
 - **Size** (radius, side length, or width / height, depending on the shape)
 - **X / Y**
 
-Place one from the **Orientation marker** tab (**Add Orientation Marker**, then click the scene). Several markers are allowed. They appear on both mapping views, without a map label.
+Place one from the **Orientation marker** tab (**Add Orientation Marker**, then click the scene). Shape and size come from **Actions** on that tab. Several markers are allowed. They appear on both mapping views, without a map label.
 
 They are stored in native JSON (`orientation_markers`) and written to the Excel / analysis workbooks (sheet `orientation_markers`, geometry only). SpikeInterface export omits them.
 
@@ -159,6 +167,7 @@ Listed under **Help > Keyboard shortcuts...**:
 - Click / Ctrl+Click / box-drag: selection
 - Middle-drag: pan; wheel: zoom
 - X/Y or dX/dY: move
+- Add Electrode / Pad / Orientation Marker: set shape, size, and (for electrodes and pads) label defaults in Actions, then click the scene
 - Delete / Backspace: delete selected
 - Ctrl+Z / Ctrl+Y: undo / redo
 - Ctrl+0: fit both maps
