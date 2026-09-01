@@ -259,6 +259,95 @@ class FunctionalWorkflowTests(unittest.TestCase):
         self.assertAlmostEqual(pad.x, pad_before[0])
         self.assertAlmostEqual(pad.y, pad_before[1])
 
+    def _select_electrodes(self, *eids: int) -> None:
+        self.editor.scene.clearSelection()
+        for eid in eids:
+            self.editor.items[eid].setSelected(True)
+        _pump()
+        self.editor._refresh_panel_values()
+
+    def test_distribute_x_spaces_electrodes_between_extremes(self) -> None:
+        self._make_grid(1, 3)
+        self.editor.items[0].setPos(0.0, 10.0)
+        self.editor.items[1].setPos(10.0, 20.0)
+        self.editor.items[2].setPos(100.0, 30.0)
+        pad_positions = {pad.pad_id: (pad.x, pad.y) for pad in self.editor.pads.values()}
+        self._select_electrodes(0, 1, 2)
+        self.editor._distribute_selection("x")
+        _pump()
+        self.assertAlmostEqual(self.editor.electrodes[0].x, 0.0)
+        self.assertAlmostEqual(self.editor.electrodes[1].x, 50.0)
+        self.assertAlmostEqual(self.editor.electrodes[2].x, 100.0)
+        self.assertAlmostEqual(self.editor.electrodes[0].y, 10.0)
+        self.assertAlmostEqual(self.editor.electrodes[1].y, 20.0)
+        self.assertAlmostEqual(self.editor.electrodes[2].y, 30.0)
+        for pad in self.editor.pads.values():
+            self.assertAlmostEqual(pad.x, pad_positions[pad.pad_id][0])
+            self.assertAlmostEqual(pad.y, pad_positions[pad.pad_id][1])
+
+    def test_distribute_y_spaces_pads_between_extremes(self) -> None:
+        self._make_grid(1, 3)
+        pads = sorted(self.editor.pads.values(), key=lambda pad: pad.electrode_eid)
+        self.editor.pad_items[pads[0].pad_id].setPos(5.0, 0.0)
+        self.editor.pad_items[pads[1].pad_id].setPos(15.0, 10.0)
+        self.editor.pad_items[pads[2].pad_id].setPos(25.0, 40.0)
+        electrode_positions = {eid: (model.x, model.y) for eid, model in self.editor.electrodes.items()}
+        self.editor.scene.clearSelection()
+        for pad in pads:
+            self.editor.pad_items[pad.pad_id].setSelected(True)
+        _pump()
+        self.editor._distribute_selection("y")
+        _pump()
+        moved = [self.editor.pads[pad.pad_id] for pad in pads]
+        self.assertAlmostEqual(moved[0].y, 0.0)
+        self.assertAlmostEqual(moved[1].y, 20.0)
+        self.assertAlmostEqual(moved[2].y, 40.0)
+        self.assertAlmostEqual(moved[0].x, 5.0)
+        self.assertAlmostEqual(moved[1].x, 15.0)
+        self.assertAlmostEqual(moved[2].x, 25.0)
+        for eid, (x, y) in electrode_positions.items():
+            self.assertAlmostEqual(self.editor.electrodes[eid].x, x)
+            self.assertAlmostEqual(self.editor.electrodes[eid].y, y)
+
+    def test_distribute_x_spaces_markers_and_supports_undo(self) -> None:
+        self._make_grid(1, 1)
+        self.editor._add_marker_at(0.0, 1.0)
+        self.editor._add_marker_at(12.0, 2.0)
+        self.editor._add_marker_at(90.0, 3.0)
+        _pump()
+        marker_ids = sorted(self.editor.orientation_markers)
+        originals = {
+            marker_id: (self.editor.orientation_markers[marker_id].x, self.editor.orientation_markers[marker_id].y)
+            for marker_id in marker_ids
+        }
+        self.editor.scene.clearSelection()
+        for marker_id in marker_ids:
+            self.editor.marker_items[marker_id].setSelected(True)
+        _pump()
+        self.editor._distribute_selection("x")
+        _pump()
+        xs = [self.editor.orientation_markers[marker_id].x for marker_id in marker_ids]
+        self.assertAlmostEqual(xs[0], 0.0)
+        self.assertAlmostEqual(xs[1], 45.0)
+        self.assertAlmostEqual(xs[2], 90.0)
+        self.editor._undo()
+        _pump()
+        for marker_id, (x, y) in originals.items():
+            self.assertAlmostEqual(self.editor.orientation_markers[marker_id].x, x)
+            self.assertAlmostEqual(self.editor.orientation_markers[marker_id].y, y)
+
+    def test_distribute_requires_three_items_of_same_type(self) -> None:
+        self._make_grid(1, 2)
+        before = {
+            eid: (model.x, model.y) for eid, model in self.editor.electrodes.items()
+        }
+        self._select_electrodes(0, 1)
+        self.editor._distribute_selection("x")
+        _pump()
+        for eid, (x, y) in before.items():
+            self.assertAlmostEqual(self.editor.electrodes[eid].x, x)
+            self.assertAlmostEqual(self.editor.electrodes[eid].y, y)
+
     def test_add_electrode_pad_and_marker_then_undo_redo(self) -> None:
         self._make_grid()
         n_e = len(self.editor.electrodes)
@@ -549,6 +638,95 @@ class FunctionalWorkflowTests(unittest.TestCase):
         first = next(iter(self.editor.electrodes.values()))
         shown = size_field_from_stored_half(first.shape, first.radius)
         self.assertGreater(shown, 0.0)
+
+    def test_align_selection_by_x_or_y(self) -> None:
+        self._make_grid(2, 2)
+        for item in self.editor.items.values():
+            item.setSelected(True)
+        _pump()
+        self.editor._refresh_panel_values()
+        self.assertEqual(self.editor.x_edit.text(), "")
+        self.assertEqual(self.editor.y_edit.text(), "")
+        pad_before = {pad.pad_id: (pad.x, pad.y) for pad in self.editor.pads.values()}
+        self.editor.x_edit.setText("12")
+        self.editor.y_edit.setText("")
+        self.editor._apply_pending_edits()
+        _pump()
+        ys = sorted(round(model.y, 6) for model in self.editor.electrodes.values())
+        self.assertEqual(ys, [0.0, 0.0, 50.0, 50.0])
+        for model in self.editor.electrodes.values():
+            self.assertAlmostEqual(model.x, 12.0)
+        for pad in self.editor.pads.values():
+            self.assertAlmostEqual(pad.x, pad_before[pad.pad_id][0])
+            self.assertAlmostEqual(pad.y, pad_before[pad.pad_id][1])
+
+        self.editor.scene.clearSelection()
+        column = [item for item in self.editor.items.values() if abs(item.model.y - 0.0) < 1e-9]
+        self.assertEqual(len(column), 2)
+        for item in column:
+            item.setSelected(True)
+        _pump()
+        self.editor._refresh_panel_values()
+        self.assertEqual(self.editor.y_edit.text(), "0.00")
+        self.editor.y_edit.setText("8")
+        self.editor.x_edit.setText("")
+        self.editor._apply_pending_edits()
+        _pump()
+        for item in column:
+            self.assertAlmostEqual(item.model.y, 8.0)
+            self.assertAlmostEqual(item.model.x, 12.0)
+
+        self.editor.scene.clearSelection()
+        for item in self.editor.pad_items.values():
+            item.setSelected(True)
+        _pump()
+        self.editor._refresh_panel_values()
+        pad_x_before = {pad.pad_id: pad.x for pad in self.editor.pads.values()}
+        self.editor.pad_x_edit.setText("")
+        self.editor.pad_y_edit.setText("7")
+        self.editor._apply_pending_pad_edits()
+        _pump()
+        for pad in self.editor.pads.values():
+            self.assertAlmostEqual(pad.y, 7.0)
+            self.assertAlmostEqual(pad.x, pad_x_before[pad.pad_id])
+
+        self.editor._add_marker_at(1.0, 2.0)
+        self.editor._add_marker_at(30.0, 40.0)
+        _pump()
+        self.editor.scene.clearSelection()
+        for item in self.editor.marker_items.values():
+            item.setSelected(True)
+        _pump()
+        self.editor._refresh_panel_values()
+        self.editor.marker_x_edit.setText("9")
+        self.editor.marker_y_edit.setText("")
+        self.editor._apply_pending_marker_edits()
+        _pump()
+        markers = list(self.editor.orientation_markers.values())
+        self.assertEqual(len(markers), 2)
+        ys = sorted(round(marker.y, 6) for marker in markers)
+        self.assertEqual(ys, [2.0, 40.0])
+        for marker in markers:
+            self.assertAlmostEqual(marker.x, 9.0)
+
+        self.editor.marker_x_edit.setText("5")
+        self.editor.marker_y_edit.setText("-3")
+        self.editor._apply_pending_marker_edits()
+        _pump()
+        for marker in self.editor.orientation_markers.values():
+            self.assertAlmostEqual(marker.x, 5.0)
+            self.assertAlmostEqual(marker.y, -3.0)
+
+    def test_single_item_keeps_other_axis(self) -> None:
+        self._make_grid()
+        self._select_electrode(0)
+        original_y = self.editor.electrodes[0].y
+        self.editor.x_edit.setText("33")
+        self.editor.y_edit.setText("")
+        self.editor._apply_pending_edits()
+        _pump()
+        self.assertAlmostEqual(self.editor.electrodes[0].x, 33.0)
+        self.assertAlmostEqual(self.editor.electrodes[0].y, original_y)
 
 
 if __name__ == "__main__":

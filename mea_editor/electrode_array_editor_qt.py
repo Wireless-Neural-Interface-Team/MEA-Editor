@@ -148,6 +148,10 @@ TAB_ELECTRODES = 0
 TAB_PADS = 1
 TAB_MARKERS = 2
 MIXED_SHAPE_LABEL = "(mixed)"
+XY_EDIT_TOOLTIP = (
+    "Leave empty to keep this coordinate. A filled value is applied to every "
+    "selected item (aligns them on that axis)."
+)
 NEW_ARRAY_WARN_COUNT = 1024
 # Skip per-item inspector work when a rubber-band selects this many contacts.
 LARGE_SELECTION_PANEL = 64
@@ -476,8 +480,25 @@ class ElectrodeArrayEditorQt(QMainWindow):
         b_move = QPushButton("Move")
         b_move.setAutoDefault(False)
         b_move.clicked.connect(self._move_selection_by_delta)
+        b_distribute_x = QPushButton("Along X")
+        b_distribute_x.setAutoDefault(False)
+        b_distribute_x.setToolTip(
+            "Space selected electrodes, pads, and orientation markers evenly "
+            "between the leftmost and rightmost item of each type. Items selected "
+            "only because they are linked to the selection are left unchanged."
+        )
+        b_distribute_x.clicked.connect(lambda _checked=False: self._distribute_selection("x"))
+        b_distribute_y = QPushButton("Along Y")
+        b_distribute_y.setAutoDefault(False)
+        b_distribute_y.setToolTip(
+            "Space selected electrodes, pads, and orientation markers evenly "
+            "between the items with the smallest and largest Y of each type. "
+            "Items selected only because they are linked to the selection are left unchanged."
+        )
+        b_distribute_y.clicked.connect(lambda _checked=False: self._distribute_selection("y"))
         form.addRow("Selected", self.selected_count_label)
         form.addRow("dX / dY", self._make_row(self.dx_edit, self.dy_edit, b_move))
+        form.addRow("Distribute", self._make_row(b_distribute_x, b_distribute_y))
         return box
 
     def _build_electrode_tab(self) -> QWidget:
@@ -510,8 +531,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.height_edit = QLineEdit("")
         self.x_edit = QLineEdit("")
         self.y_edit = QLineEdit("")
-        self.x_edit.setToolTip("Requires exactly one selected electrode. Leave empty to keep X/Y.")
-        self.y_edit.setToolTip("Requires exactly one selected electrode. Leave empty to keep X/Y.")
+        self.x_edit.setToolTip(XY_EDIT_TOOLTIP)
+        self.y_edit.setToolTip(XY_EDIT_TOOLTIP)
         self.contact_plane_axis_edit = QLineEdit("")
         self.contact_plane_axis_edit.setPlaceholderText("x0, x1, y0, y1")
         self.shape_combo = QComboBox()
@@ -642,8 +663,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.pad_height_edit = QLineEdit("")
         self.pad_x_edit = QLineEdit("")
         self.pad_y_edit = QLineEdit("")
-        self.pad_x_edit.setToolTip("Requires exactly one selected pad. Leave empty to keep X/Y.")
-        self.pad_y_edit.setToolTip("Requires exactly one selected pad. Leave empty to keep X/Y.")
+        self.pad_x_edit.setToolTip(XY_EDIT_TOOLTIP)
+        self.pad_y_edit.setToolTip(XY_EDIT_TOOLTIP)
         self.pad_electrode_combo = QComboBox()
         self.pad_shape_combo = QComboBox()
         self.pad_shape_combo.addItems(list(PAD_SHAPES))
@@ -758,8 +779,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.marker_height_edit = QLineEdit("")
         self.marker_x_edit = QLineEdit("")
         self.marker_y_edit = QLineEdit("")
-        self.marker_x_edit.setToolTip("Requires exactly one selected marker. Leave empty to keep X/Y.")
-        self.marker_y_edit.setToolTip("Requires exactly one selected marker. Leave empty to keep X/Y.")
+        self.marker_x_edit.setToolTip(XY_EDIT_TOOLTIP)
+        self.marker_y_edit.setToolTip(XY_EDIT_TOOLTIP)
         self.marker_shape_combo = QComboBox()
         self.marker_shape_combo.addItems(list(MARKER_SHAPES))
         self.marker_size_label = QLabel(primary_size_field_label(DEFAULT_MARKER_SHAPE))
@@ -907,7 +928,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
             "Drag empty area: box selection\n"
             "Middle-drag: pan the view\n"
             "Wheel: zoom\n"
-            "Move: X/Y on one item, or dX/dY on the selection\n"
+            "Move: X and/or Y on the selection (empty keeps that axis), or dX/dY\n"
+            "Distribute Along X / Along Y: even spacing between the two extremes of each selected type\n"
             "Add Electrode: set shape/size/label in Actions, then click the scene\n"
             "Add Pad: set shape/size/label in Actions, choose an electrode, then click the scene\n"
             "Add Orientation Marker: set shape/size in Actions, then click the scene\n"
@@ -952,6 +974,17 @@ class ElectrodeArrayEditorQt(QMainWindow):
             elif isinstance(item, OrientationMarkerView):
                 markers.append(item)
         return electrodes, pads, markers
+
+    def _user_selected_classified_items(
+        self,
+    ) -> tuple[list[ElectrodeView], list[PadView], list[OrientationMarkerView]]:
+        """Scene selection without pads/electrodes added only as associated counterparts."""
+        electrodes, pads, markers = self._classified_selected_items()
+        return (
+            [item for item in electrodes if item.model.eid not in self._auto_selected_electrode_eids],
+            [item for item in pads if item.model.pad_id not in self._auto_selected_pad_ids],
+            markers,
+        )
 
     def _selected_electrode_items(self) -> list[ElectrodeView]:
         """Return currently selected items, filtered to ElectrodeView."""
@@ -3112,12 +3145,59 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._set_attribute_schema(schema, prune=True)
         self._commit_if_changed(before)
 
+    @staticmethod
+    def _common_coord_text(values: list[float]) -> str:
+        """Format a shared coordinate, or empty when values differ."""
+        if not values:
+            return ""
+        if max(values) - min(values) < 1e-9:
+            return f"{values[0]:.2f}"
+        return ""
+
+    def _set_xy_edits_from_items(self, x_edit: QLineEdit, y_edit: QLineEdit, items) -> None:
+        """Fill X/Y fields from one or many items; mixed axes stay empty."""
+        x_edit.setText(self._common_coord_text([it.model.x for it in items]))
+        y_edit.setText(self._common_coord_text([it.model.y for it in items]))
+
+    def _parse_optional_xy(self, x_text: str, y_text: str) -> tuple[float | None, float | None] | None:
+        """Parse X and/or Y. Empty means unchanged. None means invalid input."""
+        x_value: float | None = None
+        y_value: float | None = None
+        if x_text:
+            try:
+                x_value = float(x_text)
+            except ValueError:
+                QMessageBox.critical(self, "Invalid X/Y", "X must be a numeric value.")
+                return None
+        if y_text:
+            try:
+                y_value = float(y_text)
+            except ValueError:
+                QMessageBox.critical(self, "Invalid X/Y", "Y must be a numeric value.")
+                return None
+        return x_value, y_value
+
+    def _apply_xy_to_items(self, items, x_value: float | None, y_value: float | None) -> None:
+        """Set X and/or Y on every item. None leaves that axis unchanged."""
+        if x_value is None and y_value is None:
+            return
+        self._is_mutating_scene = True
+        try:
+            for item in items:
+                pos = item.pos()
+                item.setPos(
+                    pos.x() if x_value is None else x_value,
+                    pos.y() if y_value is None else y_value,
+                )
+        finally:
+            self._is_mutating_scene = False
+
     def _apply_pending_edits(self) -> None:
         """
         Apply all non-empty edit-panel fields in one confirmation action.
 
-        Empty text fields are treated as "no change". For X/Y, both values must
-        be provided together and require exactly one selected electrode.
+        Empty text fields are treated as "no change". X and Y can be set
+        independently: a filled axis is applied to every selected electrode.
         """
         selected = self._selected_electrode_items()
         if not selected:
@@ -3156,12 +3236,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 )
                 return
 
-        if (x_text and not y_text) or (y_text and not x_text):
-            QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
+        parsed_xy = self._parse_optional_xy(x_text, y_text)
+        if parsed_xy is None:
             return
-        if (x_text or y_text) and len(selected) != 1:
-            QMessageBox.information(self, "Single selection required", "X/Y edition requires exactly one electrode.")
-            return
+        x_value, y_value = parsed_xy
 
         before = self._capture_state()
 
@@ -3188,16 +3266,6 @@ class ElectrodeArrayEditorQt(QMainWindow):
                     raise ValueError
             except ValueError:
                 QMessageBox.critical(self, "Invalid height", "Height must be a positive number.")
-                return
-
-        x_value: float | None = None
-        y_value: float | None = None
-        if x_text and y_text:
-            try:
-                x_value = float(x_text)
-                y_value = float(y_text)
-            except ValueError:
-                QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
                 return
 
         plane_value: tuple[float, float, float, float] | None = None
@@ -3235,8 +3303,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
                     item.set_height(item.model.radius)
             item.sync_from_model()
 
-        if x_value is not None and y_value is not None:
-            selected[0].setPos(x_value, y_value)
+        self._apply_xy_to_items(selected, x_value, y_value)
 
         self._update_duplicate_flags()
         self._refresh_pad_electrode_combo()
@@ -3248,17 +3315,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def _move_selection_by_delta(self) -> None:
         """Move selected electrodes, pads, and orientation markers by (dX, dY)."""
-        electrodes = [
-            item
-            for item in self._selected_electrode_items()
-            if item.model.eid not in self._auto_selected_electrode_eids
-        ]
-        pads = [
-            item
-            for item in self._selected_pad_items()
-            if item.model.pad_id not in self._auto_selected_pad_ids
-        ]
-        markers = self._selected_marker_items()
+        electrodes, pads, markers = self._user_selected_classified_items()
         if not electrodes and not pads and not markers:
             return
         before = self._capture_state()
@@ -3277,6 +3334,52 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self._is_mutating_scene = False
         self._on_scene_visuals_changed()
         self._commit_if_changed(before)
+
+    def _distribute_selection(self, axis: str) -> None:
+        """Evenly space each selected type between its two extremes along X or Y."""
+        electrodes, pads, markers = self._user_selected_classified_items()
+        if not electrodes and not pads and not markers:
+            return
+        groups = [group for group in (electrodes, pads, markers) if len(group) >= 3]
+        if not groups:
+            QMessageBox.information(
+                self,
+                "Selection too small",
+                "Distribute needs at least three selected electrodes, pads, or "
+                "orientation markers of the same type.",
+            )
+            return
+        before = self._capture_state()
+        self._is_mutating_scene = True
+        try:
+            for group in groups:
+                self._distribute_items_along_axis(group, axis)
+        finally:
+            self._is_mutating_scene = False
+        self._on_scene_visuals_changed()
+        self._commit_if_changed(before)
+
+    @staticmethod
+    def _distribute_items_along_axis(items, axis: str) -> None:
+        """Keep the two extreme items fixed and space the others evenly on one axis."""
+        if axis == "x":
+            ordered = sorted(items, key=lambda item: (item.pos().x(), item.pos().y()))
+            start = ordered[0].pos().x()
+            end = ordered[-1].pos().x()
+        else:
+            ordered = sorted(items, key=lambda item: (item.pos().y(), item.pos().x()))
+            start = ordered[0].pos().y()
+            end = ordered[-1].pos().y()
+        if start == end:
+            return
+        step = (end - start) / (len(ordered) - 1)
+        for index, item in enumerate(ordered[1:-1], start=1):
+            pos = item.pos()
+            value = start + index * step
+            if axis == "x":
+                item.setPos(value, pos.y())
+            else:
+                item.setPos(pos.x(), value)
 
     def _delete_selected_electrodes(self) -> None:
         """Delete selected electrodes and the pads associated with them."""
@@ -3324,17 +3427,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """
         if self._is_adding():
             return
-        electrodes = [
-            item
-            for item in self._selected_electrode_items()
-            if item.model.eid not in self._auto_selected_electrode_eids
-        ]
-        pads = [
-            item
-            for item in self._selected_pad_items()
-            if item.model.pad_id not in self._auto_selected_pad_ids
-        ]
-        markers = self._selected_marker_items()
+        electrodes, pads, markers = self._user_selected_classified_items()
         if not electrodes and not pads and not markers:
             return
         before = self._capture_state()
@@ -3357,8 +3450,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """
         Apply all non-empty pad-panel fields in one confirmation action.
 
-        Empty text fields are treated as "no change". For X/Y, both values must
-        be provided together and require exactly one selected pad.
+        Empty text fields are treated as "no change". X and Y can be set
+        independently: a filled axis is applied to every selected pad.
         """
         selected = self._selected_pad_items()
         if not selected:
@@ -3375,12 +3468,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
             normalize_contact_shape(shape_text, DEFAULT_PAD_SHAPE) if apply_shape else None
         )
 
-        if (x_text and not y_text) or (y_text and not x_text):
-            QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
+        parsed_xy = self._parse_optional_xy(x_text, y_text)
+        if parsed_xy is None:
             return
-        if (x_text or y_text) and len(selected) != 1:
-            QMessageBox.information(self, "Single selection required", "X/Y edition requires exactly one pad.")
-            return
+        x_value, y_value = parsed_xy
 
         if electrode_eid is not None and electrode_eid != -1 and electrode_eid not in self.electrodes:
             QMessageBox.critical(self, "Invalid electrode", "The associated electrode does not exist.")
@@ -3431,16 +3522,6 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 QMessageBox.critical(self, "Invalid height", "Height must be a positive number.")
                 return
 
-        x_value: float | None = None
-        y_value: float | None = None
-        if x_text and y_text:
-            try:
-                x_value = float(x_text)
-                y_value = float(y_text)
-            except ValueError:
-                QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
-                return
-
         label_position = self._label_position_from_combo(self.pad_label_position_combo)
         label_orientation = self._label_orientation_from_combo(self.pad_label_orientation_combo)
 
@@ -3467,8 +3548,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
                     item.set_height(item.model.radius)
             item.sync_from_model()
 
-        if x_value is not None and y_value is not None:
-            selected[0].setPos(x_value, y_value)
+        self._apply_xy_to_items(selected, x_value, y_value)
 
         self._update_duplicate_flags()
         self._refresh_pad_add_electrode_combo()
@@ -3481,8 +3561,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """
         Apply all non-empty orientation-marker fields in one confirmation action.
 
-        Empty text fields are treated as "no change". For X/Y, both values must
-        be provided together and require exactly one selected marker.
+        Empty text fields are treated as "no change". X and Y can be set
+        independently: a filled axis is applied to every selected marker.
         """
         selected = self._selected_marker_items()
         if not selected:
@@ -3498,12 +3578,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
             normalize_contact_shape(shape_text, DEFAULT_MARKER_SHAPE) if apply_shape else None
         )
 
-        if (x_text and not y_text) or (y_text and not x_text):
-            QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
+        parsed_xy = self._parse_optional_xy(x_text, y_text)
+        if parsed_xy is None:
             return
-        if (x_text or y_text) and len(selected) != 1:
-            QMessageBox.information(self, "Single selection required", "X/Y edition requires exactly one marker.")
-            return
+        x_value, y_value = parsed_xy
 
         before = self._capture_state()
 
@@ -3532,16 +3610,6 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 QMessageBox.critical(self, "Invalid height", "Height must be a positive number.")
                 return
 
-        x_value: float | None = None
-        y_value: float | None = None
-        if x_text and y_text:
-            try:
-                x_value = float(x_text)
-                y_value = float(y_text)
-            except ValueError:
-                QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
-                return
-
         for item in selected:
             item_shape = (
                 shape_value
@@ -3559,8 +3627,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
                     item.set_height(item.model.radius)
             item.sync_from_model()
 
-        if x_value is not None and y_value is not None:
-            selected[0].setPos(x_value, y_value)
+        self._apply_xy_to_items(selected, x_value, y_value)
 
         self._reveal_confirmed_items(selected, self.electrode_view, self.pads_map_view)
         self._refresh_panel_values()
@@ -3578,10 +3645,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
             f"{len(electrodes)} electrode(s), {len(pads)} pad(s), {len(markers)} marker(s)"
         )
 
-        user_pads = [it for it in pads if it.model.pad_id not in self._auto_selected_pad_ids]
-        user_electrodes = [
-            it for it in electrodes if it.model.eid not in self._auto_selected_electrode_eids
-        ]
+        user_electrodes, user_pads, _user_markers = self._user_selected_classified_items()
         if (
             not self._is_restoring_state
             and not self.is_add_pad_mode
@@ -3643,8 +3707,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self.height_edit,
                 shape_uses_height(shape),
             )
-            self.x_edit.setText(f"{m.x:.2f}")
-            self.y_edit.setText(f"{m.y:.2f}")
+            self._set_xy_edits_from_items(self.x_edit, self.y_edit, selected)
             x0, x1, y0, y1 = m.contact_plane_axis
             self.contact_plane_axis_edit.setText(f"{x0:g}, {x1:g}, {y0:g}, {y1:g}")
             self._set_label_position_combo(self.label_position_combo, m.label_position, mixed=False)
@@ -3657,8 +3720,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         if len(selected) > LARGE_SELECTION_PANEL:
             self.radius_edit.setText("")
             self.height_edit.setText("")
-            self.x_edit.setText("")
-            self.y_edit.setText("")
+            self._set_xy_edits_from_items(self.x_edit, self.y_edit, selected)
             self.contact_plane_axis_edit.setText("")
             self._set_shape_combo(self.shape_combo, ELECTRODE_SHAPES, DEFAULT_SHAPE, mixed=True)
             self._electrode_size_shape = MIXED_SHAPE_LABEL
@@ -3713,8 +3775,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self.contact_plane_axis_edit.setText(f"{x0:g}, {x1:g}, {y0:g}, {y1:g}")
             else:
                 self.contact_plane_axis_edit.setText("")
-            self.x_edit.setText("")
-            self.y_edit.setText("")
+            self._set_xy_edits_from_items(self.x_edit, self.y_edit, selected)
             positions = [normalize_label_position(it.model.label_position) for it in selected]
             mixed_position = not all(p == positions[0] for p in positions)
             self._set_label_position_combo(self.label_position_combo, positions[0], mixed=mixed_position)
@@ -3761,8 +3822,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self.pad_height_edit,
                 shape_uses_height(shape),
             )
-            self.pad_x_edit.setText(f"{m.x:.2f}")
-            self.pad_y_edit.setText(f"{m.y:.2f}")
+            self._set_xy_edits_from_items(self.pad_x_edit, self.pad_y_edit, selected)
             self.pad_id_edit.setText(str(m.pad_id))
             self._set_label_position_combo(
                 self.pad_label_position_combo, m.label_position, mixed=False
@@ -3780,8 +3840,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         if len(selected) > LARGE_SELECTION_PANEL:
             self.pad_radius_edit.setText("")
             self.pad_height_edit.setText("")
-            self.pad_x_edit.setText("")
-            self.pad_y_edit.setText("")
+            self._set_xy_edits_from_items(self.pad_x_edit, self.pad_y_edit, selected)
             self.pad_id_edit.setText("")
             self._set_shape_combo(self.pad_shape_combo, PAD_SHAPES, DEFAULT_PAD_SHAPE, mixed=True)
             self._pad_size_shape = MIXED_SHAPE_LABEL
@@ -3842,8 +3901,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.pad_id_edit.setText(
                 str(pad_ids[0]) if all(value == pad_ids[0] for value in pad_ids) else ""
             )
-            self.pad_x_edit.setText("")
-            self.pad_y_edit.setText("")
+            self._set_xy_edits_from_items(self.pad_x_edit, self.pad_y_edit, selected)
             positions = [normalize_label_position(it.model.label_position) for it in selected]
             mixed_position = not all(p == positions[0] for p in positions)
             self._set_label_position_combo(
@@ -3899,15 +3957,13 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 shape_uses_height(shape),
             )
             self.marker_id_edit.setText(str(m.marker_id))
-            self.marker_x_edit.setText(f"{m.x:.2f}")
-            self.marker_y_edit.setText(f"{m.y:.2f}")
+            self._set_xy_edits_from_items(self.marker_x_edit, self.marker_y_edit, selected)
             return
 
         if len(selected) > LARGE_SELECTION_PANEL:
             self.marker_radius_edit.setText("")
             self.marker_height_edit.setText("")
-            self.marker_x_edit.setText("")
-            self.marker_y_edit.setText("")
+            self._set_xy_edits_from_items(self.marker_x_edit, self.marker_y_edit, selected)
             self.marker_id_edit.setText("")
             self._set_shape_combo(
                 self.marker_shape_combo, MARKER_SHAPES, DEFAULT_MARKER_SHAPE, mixed=True
@@ -3957,8 +4013,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.marker_id_edit.setText(
                 str(marker_ids[0]) if all(value == marker_ids[0] for value in marker_ids) else ""
             )
-            self.marker_x_edit.setText("")
-            self.marker_y_edit.setText("")
+            self._set_xy_edits_from_items(self.marker_x_edit, self.marker_y_edit, selected)
             return
 
         self.marker_radius_edit.setText("")
