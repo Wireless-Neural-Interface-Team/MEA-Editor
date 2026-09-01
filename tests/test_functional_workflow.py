@@ -189,6 +189,60 @@ class FunctionalWorkflowTests(unittest.TestCase):
         self.assertEqual(pad.label_position, "above")
         self.assertEqual(pad.label_orientation, 180)
 
+    def _show_and_fit_maps(self) -> None:
+        self.editor.show()
+        self.editor.resize(1600, 800)
+        _pump()
+        self.editor._fit_all_views()
+        _pump()
+
+    def test_confirm_edits_reveals_items_in_map_views(self) -> None:
+        self._make_grid()
+        self._show_and_fit_maps()
+
+        self._select_electrode(0)
+        self.editor.x_edit.setText("4000")
+        self.editor.y_edit.setText("4000")
+        self.editor._apply_pending_edits()
+        _pump()
+        electrode_item = self.editor.items[0]
+        self.assertTrue(
+            self.editor.electrode_view.visible_scene_rect().intersects(
+                electrode_item.sceneBoundingRect()
+            )
+        )
+
+        pad = next(p for p in self.editor.pads.values() if p.electrode_eid == 0)
+        self.editor.scene.clearSelection()
+        self.editor.pad_items[pad.pad_id].setSelected(True)
+        _pump()
+        self.editor._refresh_panel_values()
+        self.editor.pad_x_edit.setText("-4000")
+        self.editor.pad_y_edit.setText("4000")
+        self.editor._apply_pending_pad_edits()
+        _pump()
+        pad_item = self.editor.pad_items[pad.pad_id]
+        self.assertTrue(
+            self.editor.pads_map_view.visible_scene_rect().intersects(
+                pad_item.sceneBoundingRect()
+            )
+        )
+
+        self.editor._add_marker_at(0.0, 0.0)
+        _pump()
+        marker_id = next(iter(self.editor.marker_items))
+        self.editor.scene.clearSelection()
+        self.editor.marker_items[marker_id].setSelected(True)
+        _pump()
+        self.editor._refresh_panel_values()
+        self.editor.marker_x_edit.setText("3500")
+        self.editor.marker_y_edit.setText("-3500")
+        self.editor._apply_pending_marker_edits()
+        _pump()
+        marker_bounds = self.editor.marker_items[marker_id].sceneBoundingRect()
+        self.assertTrue(self.editor.electrode_view.visible_scene_rect().intersects(marker_bounds))
+        self.assertTrue(self.editor.pads_map_view.visible_scene_rect().intersects(marker_bounds))
+
     def test_dx_dy_moves_user_selection_only(self) -> None:
         self._make_grid()
         self._select_electrode(0)

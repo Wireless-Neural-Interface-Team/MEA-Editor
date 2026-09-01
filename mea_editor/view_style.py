@@ -90,11 +90,16 @@ def outline_for_fill(fill: QColor) -> QColor:
     )
 
 
-def apply_contact_colors(item, fill: QColor, outline: QColor | None = None) -> None:
+def apply_contact_colors(
+    item,
+    fill: QColor,
+    outline: QColor | None = None,
+    width: float = 2.0,
+) -> None:
     """Set fill, outline, and overlay-label colors on an electrode or pad view item."""
     rim = QColor(outline) if outline is not None else outline_for_fill(fill)
     item.setBrush(QBrush(fill))
-    item.setPen(cosmetic_pen(rim, 2))
+    item.setPen(cosmetic_pen(rim, width))
     item._label_center_color = label_color_for_fill(fill)
     item._label_below_color = QColor(LABEL_ON_DARK)
 

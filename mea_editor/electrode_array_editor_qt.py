@@ -2908,6 +2908,25 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.scene.setSceneRect(rect)
         self._restore_map_cameras(cameras)
 
+    def _united_item_rect(self, items, margin: float = 40.0) -> QRectF | None:
+        """Scene bounds of graphics items, expanded by `margin` scene units."""
+        if not items:
+            return None
+        united = items[0].sceneBoundingRect()
+        for item in items[1:]:
+            united = united.united(item.sceneBoundingRect())
+        return united.adjusted(-margin, -margin, margin, margin)
+
+    def _reveal_confirmed_items(self, items, *views: ElectrodeArrayView) -> None:
+        """Scroll mapping views to the confirmed items and redraw overlays now."""
+        self._invalidate_geometry_caches()
+        rect = self._united_item_rect(items)
+        self._ensure_scene_rect(extra=rect)
+        if rect is not None:
+            for view in views:
+                view.ensureVisible(rect, 80, 80)
+        self._refresh_label_layouts()
+
     def _fit_graphics_view(self, view: ElectrodeArrayView, base_rect: QRectF) -> None:
         """Fit one mapping viewport to a scene rect, centered in the plot area."""
         fit_padding = max(FIT_PADDING_MIN, FIT_PADDING_RATIO * max(base_rect.width(), base_rect.height()))
@@ -3222,7 +3241,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._update_duplicate_flags()
         self._refresh_pad_electrode_combo()
         self._refresh_pad_add_electrode_combo()
-        self._ensure_scene_rect()
+        self._reveal_confirmed_items(selected, self.electrode_view)
         self._refresh_panel_values()
         self._sync_electrode_table(reload_data=True)
         self._commit_if_changed(before)
@@ -3453,7 +3472,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
         self._update_duplicate_flags()
         self._refresh_pad_add_electrode_combo()
-        self._ensure_scene_rect()
+        self._reveal_confirmed_items(selected, self.pads_map_view)
         self._refresh_panel_values()
         self._sync_electrode_table(reload_data=True)
         self._commit_if_changed(before)
@@ -3543,7 +3562,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         if x_value is not None and y_value is not None:
             selected[0].setPos(x_value, y_value)
 
-        self._ensure_scene_rect()
+        self._reveal_confirmed_items(selected, self.electrode_view, self.pads_map_view)
         self._refresh_panel_values()
         self._commit_if_changed(before)
 

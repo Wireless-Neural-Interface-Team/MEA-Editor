@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from PySide6.QtGui import QImage, QPainter
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QGraphicsScene,
@@ -59,3 +59,30 @@ class SelectionOverlayTests(unittest.TestCase):
         pad_item.paint(painter, option, None)
         marker_item.paint(painter, option, None)
         painter.end()
+
+    def test_selected_error_electrode_keeps_red_fill_with_yellow_outline(self) -> None:
+        scene = QGraphicsScene()
+        electrode = Electrode(eid=1, x=0.0, y=0.0, has_missing_pad=True)
+        item = ElectrodeView(electrode, lambda: None, lambda: None)
+        scene.addItem(item)
+        self.assertEqual(item.brush().color(), QColor("#d44b4b"))
+        self.assertEqual(item.pen().color(), QColor("#ffe0e0"))
+
+        item.setSelected(True)
+        self.assertTrue(item.isSelected())
+        self.assertEqual(item.brush().color(), QColor("#d44b4b"))
+        self.assertEqual(item.pen().color(), QColor("#ffd447"))
+        self.assertEqual(item.pen().widthF(), 4.0)
+
+    def test_selected_error_pad_keeps_red_fill_with_yellow_outline(self) -> None:
+        scene = QGraphicsScene()
+        pad = Pad(pad_id=1, electrode_eid=99, x=0.0, y=0.0)
+        item = PadView(pad, lambda: None, lambda: None, lambda eid: None)
+        scene.addItem(item)
+        self.assertEqual(item.brush().color(), QColor("#d44b4b"))
+
+        item.setSelected(True)
+        self.assertTrue(item.isSelected())
+        self.assertEqual(item.brush().color(), QColor("#d44b4b"))
+        self.assertEqual(item.pen().color(), QColor("#ffd447"))
+        self.assertEqual(item.pen().widthF(), 4.0)

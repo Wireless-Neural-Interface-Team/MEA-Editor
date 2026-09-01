@@ -20,7 +20,7 @@ except ImportError as exc:
 from .contact_shape import contact_path_box
 from .electrode import DEFAULT_PLANE_AXIS, Electrode
 from .electrode_array_view import PerViewContactLabels
-from .view_style import apply_contact_colors, cosmetic_pen, electrode_fill_for_shank
+from .view_style import apply_contact_colors, electrode_fill_for_shank
 
 MapLabelFn = Callable[[Electrode], tuple[str, str]]
 
@@ -112,17 +112,22 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
         Priority: add-pad target (yellow) > pairing/duplicate (red) > selected
         (yellow) > color by shank. The add-pad target must win over red: the
         electrode that still needs a pad is exactly the one shown as unpaired.
+        A selected red electrode keeps its error fill and gets a thick yellow
+        outline so the selection stays visible.
         """
         if self._is_add_target:
-            apply_contact_colors(self, QColor("#ffd447"), QColor("#ffffff"))
-            self.setPen(cosmetic_pen(QColor("#ffffff"), 4))
+            apply_contact_colors(self, QColor("#ffd447"), QColor("#ffffff"), 4)
             self.setZValue(20)
             return
-        self.setZValue(10)
         is_duplicate = self.model.has_any_duplicate()
+        is_selected = self.isSelected()
+        self.setZValue(15 if is_selected else 10)
         if is_duplicate:
-            apply_contact_colors(self, QColor("#d44b4b"), QColor("#ffe0e0"))
-        elif self.isSelected():
+            if is_selected:
+                apply_contact_colors(self, QColor("#d44b4b"), QColor("#ffd447"), 4)
+            else:
+                apply_contact_colors(self, QColor("#d44b4b"), QColor("#ffe0e0"))
+        elif is_selected:
             apply_contact_colors(self, QColor("#ffd447"), QColor("#f6f7f8"))
         else:
             apply_contact_colors(self, self._color_for_shank())

@@ -111,12 +111,17 @@ class PadView(PerViewContactLabels, QGraphicsPathItem):
         Apply fill and outline colors based on state.
 
         Priority: pairing/duplicate error (red) > selected (yellow) >
-        purple by shank.
+        purple by shank. A selected red pad keeps its error fill and gets a
+        thick yellow outline so the selection stays visible.
         """
         is_error = self.model.has_any_duplicate() or not self._has_valid_electrode()
+        is_selected = self.isSelected()
         if is_error:
-            apply_contact_colors(self, QColor("#d44b4b"), QColor("#ffe0e0"))
-        elif self.isSelected():
+            if is_selected:
+                apply_contact_colors(self, QColor("#d44b4b"), QColor("#ffd447"), 4)
+            else:
+                apply_contact_colors(self, QColor("#d44b4b"), QColor("#ffe0e0"))
+        elif is_selected:
             apply_contact_colors(self, QColor("#ffd447"), QColor("#f6f7f8"))
         else:
             apply_contact_colors(self, self._color_for_shank())
