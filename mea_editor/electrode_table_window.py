@@ -384,8 +384,9 @@ class ElectrodeTableWindow(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableView.NoEditTriggers)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
+        self._fitted_column_count = -1
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -488,6 +489,10 @@ class ElectrodeTableWindow(QWidget):
         self.hide()
 
     def _fit_columns(self) -> None:
+        column_count = self.model.columnCount()
+        if column_count == self._fitted_column_count:
+            return
+        self._fitted_column_count = column_count
         self.table.resizeColumnsToContents()
 
     def _rebuild_filter_combos(self, previous: dict[str, str]) -> None:

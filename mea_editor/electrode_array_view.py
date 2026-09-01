@@ -9,14 +9,14 @@ Responsibilities:
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 try:
-    from PySide6.QtCore import QPointF, QRectF, Qt
-    from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QTransform
+    from PySide6.QtCore import QPointF, QRect, QRectF, Qt
+    from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
     from PySide6.QtWidgets import (
         QFrame,
-        QGraphicsItem,
         QGraphicsScene,
-        QGraphicsSimpleTextItem,
         QGraphicsView,
         QStyle,
         QStyleOptionGraphicsItem,
@@ -38,11 +38,146 @@ AXIS_BAND_HEIGHT = 24
 AXIS_BAND_WIDTH = 52
 # Min pixel distance between axis tick labels to avoid overlap.
 GRID_MIN_LABEL_SPACING_PX = 44
+# Min pixel distance between grid lines (tighter than tick labels).
+GRID_MIN_LINE_SPACING_PX = 8
+# Hide map labels when the contact is smaller than this on screen.
+LABEL_MIN_CONTACT_PX = 8.0
+MAP_LABEL_FONT_POINT = 9
+# Skip antialiasing when the view transform is this small.
+AA_MIN_LOD = 0.35
 # Keep contact labels inside the plot area when fitting.
 FIT_LABEL_MARGIN_PX = 42.0
-ZOOM_MIN_SCALE = 0.02
-ZOOM_MAX_SCALE = 80.0
-MAP_VIEW_ATTRS = ("electrode_map_view", "pad_map_view")
+# Absolute zoom floor/ceiling (scene units per pixel). The floor must stay
+# below a typical pad-view fit scale, otherwise wheel zoom is a no-op in both
+# directions (new_scale stays < min). Pads surround the array so they fit
+# smaller than electrodes.
+ZOOM_MIN_SCALE = 1e-4
+ZOOM_MAX_SCALE = 250.0
+_IDLE_VIEWPORT_UPDATE = QGraphicsView.BoundingRectViewportUpdate
+
+
+def clamp_zoom_factor(current: float, factor: float) -> float | None:
+    """Keep `current * factor` inside [ZOOM_MIN_SCALE, ZOOM_MAX_SCALE].
+
+    If the view is already outside the range (a fitted pad camera can sit
+    below a previous min), still allow a step that moves back toward it.
+    Return None only when that direction is fully blocked.
+    """
+    if current <= 0 or factor == 1.0:
+        return None
+    if factor > 1.0:
+        if current >= ZOOM_MAX_SCALE:
+            return None
+        return min(factor, ZOOM_MAX_SCALE / current)
+    if current <= ZOOM_MIN_SCALE:
+        return None
+    return max(factor, ZOOM_MIN_SCALE / current)
+
+
+def grow_scene_rect_to_include(scene: QGraphicsScene | None, rect: QRectF) -> None:
+    """Union `rect` into the shared scene rect without jumping other cameras.
+
+    QGraphicsView clamps pan/zoom-to-cursor to sceneRect. Growing it lets a
+    mapping view zoom out past the fitted content. setSceneRect recenters
+    AlignCenter cameras, so each view's scene point at the viewport center
+    is restored afterwards.
+    """
+    if scene is None or not rect.isValid() or rect.isEmpty():
+        return
+    current = scene.sceneRect()
+    if current.isValid() and not current.isEmpty() and current.contains(rect):
+        return
+    cameras = []
+    for view in scene.views():
+        capture = getattr(view, "capture_camera", None)
+        if capture is not None:
+            cameras.append((view, capture()))
+    scene.setSceneRect(current.united(rect) if current.isValid() and not current.isEmpty() else rect)
+    for view, center in cameras:
+        restore = getattr(view, "restore_camera", None)
+        if restore is not None:
+            restore(center)
+
+
+def subsample_axis_positions(
+    values,
+    map_px,
+    min_spacing_px: float,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> list:
+    """Keep increasing coordinates whose projected pixels stay `min_spacing_px` apart."""
+    kept = []
+    last_px = None
+    for value in values:
+        if lo is not None and value < lo:
+            continue
+        if hi is not None and value > hi:
+            continue
+        px = map_px(value)
+        if last_px is not None and abs(px - last_px) < min_spacing_px:
+            continue
+        kept.append(value)
+        last_px = px
+    return kept
+
+
+class OverlayLabelPart(NamedTuple):
+    """One map label in contact item coordinates, sized in viewport pixels."""
+
+    item_pos: QPointF
+    pixel_w: float
+    pixel_h: float
+    degrees: int
+    text: str
+    contrast: bool
+    is_center: bool
+
+
+def overlay_label_parts(item, scale: float, metrics: QFontMetrics) -> list[OverlayLabelPart]:
+    """Layout center/outside map text for overlay painting (no scene items)."""
+    center = str(getattr(item, "_label_center", "") or "")
+    below = str(getattr(item, "_label_below", "") or "")
+    if not center and not below:
+        return []
+    half_fn = getattr(item, "_label_half_extents", None)
+    if half_fn is None:
+        return []
+    half_x, half_y = half_fn()
+    if max(half_x, half_y) * 2.0 * scale < LABEL_MIN_CONTACT_PX:
+        return []
+    model = item.model
+    position = normalize_label_position(
+        getattr(model, "label_position", DEFAULT_LABEL_POSITION)
+    )
+    orientation = normalize_label_orientation(
+        getattr(model, "label_orientation", DEFAULT_LABEL_ORIENTATION)
+    )
+    parts: list[OverlayLabelPart] = []
+    flags = int(Qt.AlignLeft | Qt.AlignTop | Qt.TextDontClip)
+    if center:
+        br = metrics.boundingRect(QRect(0, 0, 400, 200), flags, center)
+        pw, ph = float(br.width()), float(br.height())
+        parts.append(
+            OverlayLabelPart(
+                QPointF(-pw / (2.0 * scale), ph / (2.0 * scale)),
+                pw,
+                ph,
+                0,
+                center,
+                False,
+                True,
+            )
+        )
+    if below:
+        br = metrics.boundingRect(QRect(0, 0, 400, 400), flags, below)
+        pw, ph = float(br.width()), float(br.height())
+        degrees = orientation
+        x, y = map_label_item_pos(
+            position, half_x, half_y, pw / scale, ph / scale, orientation=degrees
+        )
+        parts.append(OverlayLabelPart(QPointF(x, y), pw, ph, degrees, below, True, False))
+    return parts
 
 
 def _option_without_qt_selection(option):
@@ -58,176 +193,37 @@ def _option_without_qt_selection(option):
     return opt
 
 
-class ViewScopedTextItem(QGraphicsSimpleTextItem):
-    """
-    Contact label that paints in only one mapping view.
-
-    Electrodes and pads share one scene shown by two cameras. Labels use
-    ItemIgnoresTransformations, so screen size is correct for a single zoom.
-    Each contact keeps one copy per camera; this item paints only in its home
-    view so the other camera can keep an independently positioned copy.
-
-    Outside labels invert against the pixels already drawn, so the same
-    glyph is light on the dark canvas and dark on a white orientation marker.
-    """
-
-    def __init__(
-        self,
-        text: str = "",
-        parent=None,
-        view_attr: str = "",
-        contrast_on_markers: bool = False,
-    ) -> None:
-        super().__init__(text, parent)
-        self._view_attr = view_attr
-        self._contrast_on_markers = contrast_on_markers
-        self.setAcceptedMouseButtons(Qt.NoButton)
-
-    def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
-        if widget is not None and not self._is_home_viewport(widget):
-            return
-        if not self._contrast_on_markers:
-            super().paint(painter, _option_without_qt_selection(option), widget)
-            return
-        # Draw the glyphs ourselves so CompositionMode_Difference is not
-        # reset by QGraphicsSimpleTextItem. White ink inverts against pixels
-        # already in the view: dark on a white marker, light on the canvas.
-        painter.setCompositionMode(QPainter.CompositionMode_Difference)
-        painter.setFont(self.font())
-        painter.setPen(QPen(QColor("#ffffff"), 0))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawText(
-            self.boundingRect(),
-            int(Qt.AlignLeft | Qt.AlignTop | Qt.TextDontClip),
-            self.text(),
-        )
-
-    def _is_home_viewport(self, widget) -> bool:
-        scene = self.scene()
-        if scene is None or not self._view_attr:
-            return True
-        view = getattr(scene, self._view_attr, None)
-        if view is None:
-            return True
-        viewport = view.viewport()
-        current = widget
-        while current is not None:
-            if current is view or current is viewport:
-                return True
-            current = current.parentWidget()
-        return False
-
-
-def _make_scoped_label(
-    parent,
-    view_attr: str,
-    font: QFont,
-    color: str,
-    contrast_on_markers: bool = False,
-) -> ViewScopedTextItem:
-    item = ViewScopedTextItem(
-        "", parent, view_attr, contrast_on_markers=contrast_on_markers
-    )
-    item.setBrush(QBrush(QColor(color)))
-    item.setFont(font)
-    item.setTransform(QTransform.fromScale(1.0, 1.0))
-    item.setFlag(QGraphicsItem.ItemIgnoresTransformations)
-    return item
-
-
-class ViewLabelPair:
-    """Center + outside labels laid out for one mapping camera."""
-
-    def __init__(self, parent, view_attr: str, font: QFont) -> None:
-        self.view_attr = view_attr
-        self.center = _make_scoped_label(parent, view_attr, font, "#e9edf2")
-        self.below = _make_scoped_label(
-            parent, view_attr, font, "#ffffff", contrast_on_markers=True
-        )
-
-    def set_text(self, center: str, below: str) -> None:
-        self.center.setText(center)
-        self.below.setText(below)
-        self.center.setVisible(bool(center))
-        self.below.setVisible(bool(below))
-
-    def set_brushes(self, center: QBrush, below: QBrush) -> None:
-        self.center.setBrush(center)
-        self.below.setBrush(below)
-
-    def layout(
-        self,
-        scale: float,
-        half_x: float,
-        half_y: float,
-        position: str,
-        orientation: int = DEFAULT_LABEL_ORIENTATION,
-    ) -> None:
-        br = self.center.boundingRect()
-        label_w, label_h = br.width() / scale, br.height() / scale
-        self.center.setRotation(0)
-        self.center.setPos(-label_w / 2, label_h / 2)
-        cbr = self.below.boundingRect()
-        text_w, text_h = cbr.width() / scale, cbr.height() / scale
-        degrees = normalize_label_orientation(orientation)
-        self.below.setRotation(degrees)
-        x, y = map_label_item_pos(
-            position, half_x, half_y, text_w, text_h, orientation=degrees
-        )
-        self.below.setPos(x, y)
-
-
 class PerViewContactLabels:
     """
-    Two label copies per contact, one per mapping camera.
+    Map-label text stored on the contact (drawn by the mapping view overlay).
 
-    Zooming one view only relayouts that view's copies, so text in the other
-    view stays put.
+    Labels are not QGraphicsItems: thousands of ItemIgnoresTransformations
+    children made rubber-band selection and pan unusable.
     """
 
     def _init_view_labels(self) -> None:
-        font = QFont()
-        font.setPointSize(9)
-        self._view_labels = [ViewLabelPair(self, attr, font) for attr in MAP_VIEW_ATTRS]
-        self.label = self._view_labels[0].center
-        self.contact_label = self._view_labels[0].below
+        self._label_center = ""
+        self._label_below = ""
+        self._label_center_color = QColor("#e9edf2")
+        self._label_below_color = QColor("#ffffff")
 
     def _set_label_text(self, center: str, below: str) -> None:
-        for pair in self._view_labels:
-            pair.set_text(center, below)
-
-    def _view_scale(self, view_attr: str) -> float:
-        scene = self.scene()
-        if scene is None:
-            return 1.0
-        if hasattr(scene, "view_scale"):
-            return scene.view_scale(getattr(scene, view_attr, None))
-        views = scene.views()
-        if not views:
-            return 1.0
-        t = views[0].transform()
-        scale = abs(t.m11()) if t.m11() != 0 else 1.0
-        return max(scale, 1e-6)
+        self._label_center = center
+        self._label_below = below
 
     def _label_half_extents(self) -> tuple[float, float]:
         return contact_half_extents(self.model.shape, self.model.radius, self.model.height)
 
-    def _layout_labels(self, view_attr: str | None = None) -> None:
-        half_x, half_y = self._label_half_extents()
-        position = normalize_label_position(
-            getattr(self.model, "label_position", DEFAULT_LABEL_POSITION)
-        )
-        orientation = normalize_label_orientation(
-            getattr(self.model, "label_orientation", DEFAULT_LABEL_ORIENTATION)
-        )
-        for pair in self._view_labels:
-            if view_attr is not None and pair.view_attr != view_attr:
-                continue
-            pair.layout(
-                self._view_scale(pair.view_attr), half_x, half_y, position, orientation
-            )
+    def _layout_labels(self, view_attr: str | None = None, **_kwargs) -> None:
+        return
+
+    def mark_label_layout_dirty(self, view_attr: str, current_scale: float) -> None:
+        return
 
     def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
+        lod = QStyleOptionGraphicsItem.levelOfDetailFromTransform(painter.worldTransform())
+        if lod < AA_MIN_LOD:
+            painter.setRenderHint(QPainter.Antialiasing, False)
         super().paint(painter, _option_without_qt_selection(option), widget)
 
 
@@ -251,13 +247,17 @@ class ElectrodeArrayView(QGraphicsView):
         super().__init__(scene)
         # Antialiasing improves circle and text rendering quality.
         self.setRenderHint(QPainter.Antialiasing, True)
+        self.setRenderHint(QPainter.TextAntialiasing, True)
+        self.setOptimizationFlag(QGraphicsView.DontSavePainterState, True)
+        self.setOptimizationFlag(QGraphicsView.DontAdjustForAntialiasing, True)
         self.setFrameShape(QFrame.NoFrame)
         # Keep content centered when the transformed scene is smaller than the view.
         self.setAlignment(Qt.AlignCenter)
         # Rubber-band drag enables box selection on empty area.
         self.setDragMode(QGraphicsView.RubberBandDrag)
-        # Full redraw avoids leftover rubber-band edges and overlay artifacts.
-        self.setViewportUpdateMode(QGraphicsView.FullViewportUpdate)
+        # Partial updates: overlay labels are not scene items, so a full
+        # redraw is no longer required to avoid rubber-band artifacts.
+        self.setViewportUpdateMode(_IDLE_VIEWPORT_UPDATE)
         self.setBackgroundBrush(QColor("#11151a"))
         # Cartesian orientation for scene coordinates: Y grows upward.
         # Qt view Y is naturally downward; scale(1,-1) flips it.
@@ -271,9 +271,13 @@ class ElectrodeArrayView(QGraphicsView):
         self._cancel_add = lambda: None
         self._on_delete = lambda: None
         self._on_view_transform_changed = lambda view=None: None
+        self._on_rubber_band_started = lambda: None
+        self._on_rubber_band_finished = lambda: None
         self._on_activated = lambda: None
         self._is_middle_panning = False
         self._last_pan_pos = None
+        self._map_label_font = QFont()
+        self._map_label_font.setPointSize(MAP_LABEL_FONT_POINT)
 
     def set_add_callbacks(self, is_add_mode, add_at, cancel_add=None) -> None:
         """
@@ -296,9 +300,14 @@ class ElectrodeArrayView(QGraphicsView):
 
     def set_view_transform_changed_callback(self, on_changed) -> None:
         """
-        Register callback when view zoom/pan changes (for label layout refresh).
+        Register callback when view zoom/pan changes (for overlay redraw).
         """
         self._on_view_transform_changed = on_changed
+
+    def set_rubber_band_callbacks(self, on_started, on_finished) -> None:
+        """Register callbacks around a left-button rubber-band / click select."""
+        self._on_rubber_band_started = on_started
+        self._on_rubber_band_finished = on_finished
 
     def set_activated_callback(self, on_activated) -> None:
         """Register callback when this viewport is clicked or zoomed."""
@@ -393,6 +402,8 @@ class ElectrodeArrayView(QGraphicsView):
                 self._add_at(scene_pos.x(), scene_pos.y())
                 event.accept()
                 return
+            self._on_rubber_band_started()
+            self.setRenderHint(QPainter.Antialiasing, False)
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[override]
@@ -421,6 +432,8 @@ class ElectrodeArrayView(QGraphicsView):
 
         super().mouseReleaseEvent(event)
         if event.button() == Qt.LeftButton:
+            self.setRenderHint(QPainter.Antialiasing, True)
+            self._on_rubber_band_finished()
             self.viewport().update()
 
     def keyPressEvent(self, event) -> None:  # type: ignore[override]
@@ -453,12 +466,30 @@ class ElectrodeArrayView(QGraphicsView):
 
         # Remember which scene point is under the cursor before scaling.
         scene_pos_before = self.mapToScene(mouse_pos)
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        current = abs(self.transform().m11())
-        new_scale = current * factor
-        if new_scale < ZOOM_MIN_SCALE or new_scale > ZOOM_MAX_SCALE:
+        delta_y = event.angleDelta().y()
+        if delta_y == 0:
+            delta_y = event.pixelDelta().y()
+        if delta_y == 0:
+            event.ignore()
+            return
+        factor = clamp_zoom_factor(
+            abs(self.transform().m11()),
+            1.15 if delta_y > 0 else 1 / 1.15,
+        )
+        if factor is None:
             event.accept()
             return
+        if factor < 1.0:
+            # Zoom-out shows more scene; grow sceneRect first so scrollbars
+            # are not clamped and the cursor-centered adjust can run.
+            visible = self.visible_scene_rect()
+            inv = 1.0 / factor
+            extra_w = visible.width() * inv
+            extra_h = visible.height() * inv
+            grow_scene_rect_to_include(
+                self.scene(),
+                visible.adjusted(-extra_w, -extra_h, extra_w, extra_h),
+            )
         self.scale(factor, factor)
 
         # After scale, that scene point moved in viewport; adjust scrollbars
@@ -478,13 +509,9 @@ class ElectrodeArrayView(QGraphicsView):
         Without this, axis bands would stay fixed during scroll.
         """
         super().scrollContentsBy(dx, dy)
-        scene = self.scene()
-        if scene is not None:
-            scene.invalidate(
-                scene.sceneRect(),
-                QGraphicsScene.BackgroundLayer | QGraphicsScene.ForegroundLayer,
-            )
         self.viewport().update()
+        if dx or dy:
+            self._on_view_transform_changed(self)
 
     def drawBackground(self, painter: QPainter, rect) -> None:  # type: ignore[override]
         """
@@ -501,13 +528,22 @@ class ElectrodeArrayView(QGraphicsView):
         xs, ys = scene.get_axes(self)  # type: ignore[attr-defined]
         if not xs and not ys:
             return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
         grid_pen = QPen(QColor("#3b4f66"))
         grid_pen.setWidthF(0)  # Cosmetic width: 1 logical pixel.
         painter.setPen(grid_pen)
-        for x in xs:
+        map_x = lambda value: self.mapFromScene(value, 0).x()
+        map_y = lambda value: self.mapFromScene(0, value).y()
+        for x in subsample_axis_positions(
+            xs, map_x, GRID_MIN_LINE_SPACING_PX, rect.left(), rect.right()
+        ):
             painter.drawLine(x, rect.top(), x, rect.bottom())
-        for y in ys:
+        for y in subsample_axis_positions(
+            ys, map_y, GRID_MIN_LINE_SPACING_PX, rect.top(), rect.bottom()
+        ):
             painter.drawLine(rect.left(), y, rect.right(), y)
+        painter.restore()
 
     def drawForeground(self, painter: QPainter, rect) -> None:  # type: ignore[override]
         """
@@ -519,6 +555,9 @@ class ElectrodeArrayView(QGraphicsView):
         scene = self.scene()
         if scene is None or not hasattr(scene, "get_axes"):
             return
+
+        self._draw_pad_links(painter, rect)
+        self._draw_contact_labels(painter)
 
         xs, ys = scene.get_axes(self)  # type: ignore[attr-defined]
         if not xs and not ys:
@@ -550,14 +589,12 @@ class ElectrodeArrayView(QGraphicsView):
 
         # X ticks: skip if outside visible area or too close to previous label.
         min_px_spacing = GRID_MIN_LABEL_SPACING_PX
-        last_x_px = -10_000
-        for x in xs:
+        for x in subsample_axis_positions(
+            xs, lambda value: self.mapFromScene(value, 0).x(), min_px_spacing, None, None
+        ):
             px = self.mapFromScene(x, 0).x()
             if px < axis_w or px > vp.width() - 2:
                 continue
-            if px - last_x_px < min_px_spacing:
-                continue
-            last_x_px = px
             painter.setPen(QColor("#6e88a5"))
             painter.drawLine(px, axis_h - 6, px, axis_h)
             painter.setPen(QColor("#d3dbe4"))
@@ -577,4 +614,83 @@ class ElectrodeArrayView(QGraphicsView):
             painter.setPen(QColor("#d3dbe4"))
             painter.drawText(4, py - 3, f"{y:.1f}")
 
+        painter.restore()
+
+    def _draw_contact_labels(self, painter: QPainter) -> None:
+        """Paint map text in viewport pixels for visible contacts only.
+
+        Labels are not QGraphicsItems: thousands of ItemIgnoresTransformations
+        children made rubber-band selection and pan unusable.
+        """
+        scale = abs(self.transform().m11())
+        if scale <= 0:
+            return
+        contacts = [
+            item
+            for item in self.items(self.viewport().rect())
+            if getattr(item, "_label_half_extents", None) is not None
+        ]
+        if not contacts:
+            return
+        font = self._map_label_font
+        metrics = QFontMetrics(font)
+        flags = int(Qt.AlignLeft | Qt.AlignTop | Qt.TextDontClip)
+        scene = self.scene()
+        contrast_ok = bool(scene is None or getattr(scene, "has_orientation_markers", False))
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        painter.resetTransform()
+        painter.setFont(font)
+        painter.setBrush(Qt.NoBrush)
+        for item in contacts:
+            parts = overlay_label_parts(item, scale, metrics)
+            if not parts:
+                continue
+            for part in parts:
+                origin = self.mapFromScene(item.mapToScene(part.item_pos))
+                painter.save()
+                painter.translate(origin.x(), origin.y())
+                if part.degrees:
+                    painter.rotate(part.degrees)
+                if part.contrast and contrast_ok:
+                    painter.setCompositionMode(QPainter.CompositionMode_Difference)
+                    painter.setPen(QColor("#ffffff"))
+                elif part.is_center:
+                    painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                    painter.setPen(
+                        getattr(item, "_label_center_color", QColor("#e9edf2"))
+                    )
+                else:
+                    painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+                    painter.setPen(
+                        getattr(item, "_label_below_color", QColor("#ffffff"))
+                    )
+                painter.drawText(QRectF(0.0, 0.0, part.pixel_w, part.pixel_h), flags, part.text)
+                painter.restore()
+        painter.restore()
+
+    def _draw_pad_links(self, painter: QPainter, rect) -> None:
+        """Dashed pad-to-electrode lines, only in the pad mapping camera."""
+        scene = self.scene()
+        if scene is None or self is not getattr(scene, "pad_map_view", None):
+            return
+        getter = getattr(scene, "pad_link_segments", None)
+        if getter is None:
+            return
+        segments = getter()
+        if not segments:
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        pen = QPen(QColor("#9fb3c8"), 1, Qt.DashLine)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        left, right, top, bottom = rect.left(), rect.right(), rect.top(), rect.bottom()
+        for x1, y1, x2, y2 in segments:
+            if max(x1, x2) < left or min(x1, x2) > right:
+                continue
+            if max(y1, y2) < top or min(y1, y2) > bottom:
+                continue
+            painter.drawLine(x1, y1, x2, y2)
         painter.restore()

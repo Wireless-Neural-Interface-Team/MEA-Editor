@@ -5,10 +5,15 @@ from __future__ import annotations
 import unittest
 
 from PySide6.QtCore import QPointF, QRectF
+from PySide6.QtGui import QFont, QFontMetrics
 from PySide6.QtWidgets import QApplication
 
 from mea_editor.electrode import Electrode
-from mea_editor.electrode_array_view import ElectrodeArrayView
+from mea_editor.electrode_array_view import (
+    ElectrodeArrayView,
+    MAP_LABEL_FONT_POINT,
+    overlay_label_parts,
+)
 from mea_editor.electrode_view import ElectrodeView
 from mea_editor.grid_scene import GridScene
 from mea_editor.orientation_marker import OrientationMarker
@@ -49,26 +54,28 @@ class LabelMarkerContrastTests(unittest.TestCase):
         marker = OrientationMarker(marker_id=1, x=10.0, y=-16.0, radius=8.0, shape="square")
         marker_item = OrientationMarkerView(marker, lambda: None, lambda: None)
         scene.addItem(marker_item)
+        scene.has_orientation_markers = True
 
         view.resize(480, 480)
         view.show()
         self._app.processEvents()
         view.fit_scene_rect(QRectF(-30.0, -40.0, 60.0, 70.0))
-        electrode_item._layout_labels("electrode_map_view")
         self._app.processEvents()
 
         try:
             pixmap = view.viewport().grab()
             dpr = pixmap.devicePixelRatio()
             image = pixmap.toImage()
-            pair = next(
-                p for p in electrode_item._view_labels if p.view_attr == "electrode_map_view"
-            )
-            label = pair.below
-            self.assertTrue(label._contrast_on_markers)
-            viewport_transform = view.viewportTransform()
-            rect = label.deviceTransform(viewport_transform).mapRect(label.boundingRect())
-            marker_from_view, ok = marker_item.deviceTransform(viewport_transform).inverted()
+            font = QFont()
+            font.setPointSize(MAP_LABEL_FONT_POINT)
+            metrics = QFontMetrics(font)
+            scale = abs(view.transform().m11())
+            parts = overlay_label_parts(electrode_item, scale, metrics)
+            below = next(part for part in parts if not part.is_center)
+            self.assertTrue(below.contrast)
+            origin = view.mapFromScene(electrode_item.mapToScene(below.item_pos))
+            rect = QRectF(origin.x(), origin.y(), below.pixel_w, below.pixel_h)
+            marker_from_view, ok = marker_item.deviceTransform(view.viewportTransform()).inverted()
             self.assertTrue(ok)
             self.assertGreater(rect.width(), 8)
             self.assertGreater(rect.height(), 6)

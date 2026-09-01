@@ -76,6 +76,8 @@ Extra electrode attributes can be added with **Add attribute**. They belong to t
 
 Defaults: Potentiostat ID and Shank ID in the contact, INTAN ID beside it. Manufacturer ID and extra attributes can be shown with that outside text. Each electrode, pad, and orientation marker has a **Label position** (`above`, `below`, `left`, `right`) and a **Label orientation** (`0°`, `90°`, `180°`, `270°` clockwise) for that outside text. Defaults: below, 0°.
 
+Outside map text stays readable when it overlaps a white orientation marker: the part on the marker is dark, the part on the dark canvas stays light. A glyph that straddles the edge can be both. Center-of-contact IDs keep a single color chosen for the fill.
+
 The choice of visible IDs is stored in native JSON (`map_labels`). The per-item side and rotation are stored on each electrode and pad (`label_position`, `label_orientation`). They are restored on open. Both are editor display only: they are not written to SpikeInterface or XLSX exports.
 
 ## Shapes
@@ -99,7 +101,7 @@ The side panel has three parameterization tabs: **Electrodes**, **Pads**, and **
 
 On each tab, **Actions** sets the defaults for new items (independent of the current selection):
 
-- **Add Electrode**: shape, size, label position, and label orientation. A linked pad is also created, using the pad **Actions** defaults.
+- **Add Electrode**: shape, size, label position, and label orientation. No pad is created; add pads separately from the Pads tab.
 - **Add Pad**: electrode to link, plus shape, size, and label defaults.
 - **Add Orientation Marker**: shape and size (no map label).
 
@@ -116,7 +118,7 @@ Fields:
 - **Size** (radius, side length, or width / height, depending on the shape)
 - **X / Y**
 
-Place one from the **Orientation marker** tab (**Add Orientation Marker**, then click the scene). Shape and size come from **Actions** on that tab. Several markers are allowed. They appear on both mapping views, without a map label.
+Place one from the **Orientation marker** tab (**Add Orientation Marker**, then click the scene). Shape and size come from **Actions** on that tab. Several markers are allowed. They appear on both mapping views, without a map label. Nearby electrode and pad outside labels invert over the white fill so the text stays readable.
 
 They are stored in native JSON (`orientation_markers`) and written to the Excel / analysis workbooks (sheet `orientation_markers`, geometry only). SpikeInterface export omits them.
 

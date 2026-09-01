@@ -26,11 +26,14 @@ class GridScene(QGraphicsScene):
         super().__init__(parent)
         # Default: no axes (empty lists).
         self._axes_provider = lambda view=None: ([], [])
+        self._pad_link_provider = lambda: ()
         # Last focused mapping view (for generic helpers).
         self.active_view = None
         # Dedicated cameras so electrode/pad labels follow their own zoom.
         self.electrode_map_view = None
         self.pad_map_view = None
+        # Fast path for label contrast: skip Difference blending when unused.
+        self.has_orientation_markers = False
 
     def view_scale(self, preferred_view=None) -> float:
         """
@@ -69,3 +72,11 @@ class GridScene(QGraphicsScene):
             (xs, ys): sorted lists of unique abscissas and ordinates.
         """
         return self._axes_provider(view)
+
+    def set_pad_link_provider(self, provider) -> None:
+        """Set the callback that provides pad-to-electrode line segments."""
+        self._pad_link_provider = provider
+
+    def pad_link_segments(self) -> tuple:
+        """Return (x1, y1, x2, y2) segments drawn in the pad mapping view."""
+        return self._pad_link_provider()

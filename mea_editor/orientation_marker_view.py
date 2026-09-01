@@ -8,7 +8,7 @@ and not labelled on the maps.
 from __future__ import annotations
 
 try:
-    from PySide6.QtGui import QBrush, QColor, QPainterPath, QPen
+    from PySide6.QtGui import QBrush, QColor, QPainterPath
     from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem
 except ImportError as exc:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from exc
@@ -16,7 +16,7 @@ except ImportError as exc:
 from .contact_shape import contact_path_box
 from .electrode_array_view import _option_without_qt_selection
 from .orientation_marker import OrientationMarker
-from .view_style import ORIENTATION_MARKER_FILL, ORIENTATION_MARKER_OUTLINE
+from .view_style import ORIENTATION_MARKER_FILL, ORIENTATION_MARKER_OUTLINE, cosmetic_pen
 
 
 class OrientationMarkerView(QGraphicsPathItem):
@@ -38,6 +38,7 @@ class OrientationMarkerView(QGraphicsPathItem):
             | QGraphicsItem.ItemSendsGeometryChanges
         )
         self.setZValue(8)
+        self.setAcceptHoverEvents(False)
         self.set_radius(model.radius)
         self.setPos(model.x, model.y)
         self._refresh_style()
@@ -71,7 +72,7 @@ class OrientationMarkerView(QGraphicsPathItem):
             fill = QColor(ORIENTATION_MARKER_FILL)
             outline = QColor(ORIENTATION_MARKER_OUTLINE)
         self.setBrush(QBrush(fill))
-        self.setPen(QPen(outline, 2))
+        self.setPen(cosmetic_pen(outline, 2))
 
     def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
         super().paint(painter, _option_without_qt_selection(option), widget)

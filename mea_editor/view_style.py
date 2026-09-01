@@ -18,6 +18,13 @@ except ImportError as exc:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from exc
 
 
+def cosmetic_pen(color: QColor, width: float = 2.0) -> QPen:
+    """Outline that stays a fixed pixel width at every zoom."""
+    pen = QPen(color, width)
+    pen.setCosmetic(True)
+    return pen
+
+
 ELECTRODE_DEFAULT_FILL = QColor("#3da5ff")
 PAD_DEFAULT_FILL = QColor("#c77dff")
 ORIENTATION_MARKER_FILL = QColor("#ffffff")
@@ -84,19 +91,12 @@ def outline_for_fill(fill: QColor) -> QColor:
 
 
 def apply_contact_colors(item, fill: QColor, outline: QColor | None = None) -> None:
-    """Set fill, outline, and label colors on an electrode or pad view item."""
+    """Set fill, outline, and overlay-label colors on an electrode or pad view item."""
     rim = QColor(outline) if outline is not None else outline_for_fill(fill)
     item.setBrush(QBrush(fill))
-    item.setPen(QPen(rim, 2))
-    center_brush = QBrush(label_color_for_fill(fill))
-    below_brush = QBrush(LABEL_ON_DARK)
-    pairs = getattr(item, "_view_labels", None)
-    if pairs:
-        for pair in pairs:
-            pair.set_brushes(center_brush, below_brush)
-        return
-    item.label.setBrush(center_brush)
-    item.contact_label.setBrush(below_brush)
+    item.setPen(cosmetic_pen(rim, 2))
+    item._label_center_color = label_color_for_fill(fill)
+    item._label_below_color = QColor(LABEL_ON_DARK)
 
 
 def color_for_shank(

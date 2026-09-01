@@ -3,12 +3,8 @@ Interactive graphics item bound to one Electrode model.
 
 It owns:
 - contact shape path (circle, square, or rect),
-- center label from the visible electrode IDs,
-- outside labels (INTAN / extras) placed above, below, left, or right,
+- center / outside map-label text (drawn by the mapping view overlay),
 - fill color that varies by shank (blues).
-
-Labels exist twice, once per mapping camera, so each view can position
-text from its own zoom.
 """
 
 from __future__ import annotations
@@ -16,7 +12,7 @@ from __future__ import annotations
 from typing import Callable
 
 try:
-    from PySide6.QtGui import QColor, QPainterPath, QPen, QTransform
+    from PySide6.QtGui import QColor, QPainterPath, QTransform
     from PySide6.QtWidgets import QGraphicsItem, QGraphicsPathItem
 except ImportError as exc:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from exc
@@ -24,7 +20,7 @@ except ImportError as exc:
 from .contact_shape import contact_path_box
 from .electrode import DEFAULT_PLANE_AXIS, Electrode
 from .electrode_array_view import PerViewContactLabels
-from .view_style import apply_contact_colors, electrode_fill_for_shank
+from .view_style import apply_contact_colors, cosmetic_pen, electrode_fill_for_shank
 
 MapLabelFn = Callable[[Electrode], tuple[str, str]]
 
@@ -57,13 +53,12 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
             | QGraphicsItem.ItemSendsGeometryChanges
         )
         self.setZValue(10)  # Above grid lines.
+        self.setAcceptHoverEvents(False)
 
-        # Labels must exist before set_radius() (which calls _layout_labels).
         self._init_view_labels()
         self._refresh_label()
         self.set_radius(model.radius)
         self.setPos(model.x, model.y)
-        self._layout_labels()
         self._refresh_style()
 
     def _refresh_label(self) -> None:
@@ -73,7 +68,6 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
         else:
             center, below = self.model.map_view_labels()
         self._set_label_text(center, below)
-        self._layout_labels()
 
     def _color_for_shank(self) -> QColor:
         """Return a blue fill color that varies by shank_id."""
@@ -102,8 +96,6 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
             x0, x1, y0, y1 = plane
             path = QTransform(x0, x1, y0, y1, 0.0, 0.0).map(path)
         self.setPath(path)
-        if hasattr(self, "_view_labels"):
-            self._layout_labels()
 
     def set_add_target(self, enabled: bool) -> None:
         """Yellow highlight for the electrode that a new pad will be linked to."""
@@ -123,7 +115,7 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
         """
         if self._is_add_target:
             apply_contact_colors(self, QColor("#ffd447"), QColor("#ffffff"))
-            self.setPen(QPen(QColor("#ffffff"), 4))
+            self.setPen(cosmetic_pen(QColor("#ffffff"), 4))
             self.setZValue(20)
             return
         self.setZValue(10)

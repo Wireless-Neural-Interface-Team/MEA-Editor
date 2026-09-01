@@ -3,13 +3,9 @@ Interactive graphics item bound to one Pad model.
 
 It owns:
 - contact shape path (circle, square, or rect),
-- center label from the associated electrode's visible IDs,
-- outside labels placed above, below, left, or right of the pad,
-- fill color that varies by the linked electrode's shank (purples),
-- dashed link line toward the associated electrode.
-
-Labels exist twice, once per mapping camera, so each view can position
-text from its own zoom.
+- center / outside map-label text from the associated electrode
+  (drawn by the mapping view overlay),
+- fill color that varies by the linked electrode's shank (purples).
 """
 
 from __future__ import annotations
@@ -17,11 +13,9 @@ from __future__ import annotations
 from typing import Callable
 
 try:
-    from PySide6.QtCore import Qt
-    from PySide6.QtGui import QColor, QPainterPath, QPen
+    from PySide6.QtGui import QColor, QPainterPath
     from PySide6.QtWidgets import (
         QGraphicsItem,
-        QGraphicsLineItem,
         QGraphicsPathItem,
     )
 except ImportError as exc:
@@ -62,18 +56,12 @@ class PadView(PerViewContactLabels, QGraphicsPathItem):
             | QGraphicsItem.ItemSendsGeometryChanges
         )
         self.setZValue(9)
-
-        self.link_item = QGraphicsLineItem()
-        self.link_item.setZValue(5)
-        self.link_item.setFlag(QGraphicsItem.ItemIsSelectable, False)
-        self.link_item.setFlag(QGraphicsItem.ItemIsFocusable, False)
-        self.link_item.setAcceptedMouseButtons(Qt.NoButton)
+        self.setAcceptHoverEvents(False)
 
         self._init_view_labels()
         self._refresh_label()
         self.set_radius(model.radius)
         self.setPos(model.x, model.y)
-        self._layout_labels()
         self._refresh_style()
         self.update_link()
 
@@ -88,7 +76,6 @@ class PadView(PerViewContactLabels, QGraphicsPathItem):
         else:
             center, below = electrode.map_view_labels()
             self._set_label_text(center, below)
-        self._layout_labels()
 
     def _color_for_shank(self) -> QColor:
         """Return a purple fill color that varies by the linked electrode's shank."""
@@ -115,8 +102,6 @@ class PadView(PerViewContactLabels, QGraphicsPathItem):
         else:
             path.addRect(x, y, w, h)
         self.setPath(path)
-        if hasattr(self, "_view_labels"):
-            self._layout_labels()
 
     def _has_valid_electrode(self) -> bool:
         return self._get_electrode(self.model.electrode_eid) is not None
@@ -135,18 +120,10 @@ class PadView(PerViewContactLabels, QGraphicsPathItem):
             apply_contact_colors(self, QColor("#ffd447"), QColor("#f6f7f8"))
         else:
             apply_contact_colors(self, self._color_for_shank())
-        link_pen = QPen(QColor("#9fb3c8"), 1, Qt.DashLine)
-        link_pen.setCosmetic(True)
-        self.link_item.setPen(link_pen)
 
     def update_link(self) -> None:
-        """Update the dashed line toward the associated electrode."""
-        electrode = self._get_electrode(self.model.electrode_eid)
-        if electrode is None:
-            self.link_item.setVisible(False)
-            return
-        self.link_item.setVisible(True)
-        self.link_item.setLine(self.model.x, self.model.y, electrode.x, electrode.y)
+        """Pad-electrode lines are drawn by the pad mapping view, not scene items."""
+        return
 
     def itemChange(self, change, value):  # type: ignore[override]
         """Copy x/y to model on position change; refresh style and panel on selection."""
@@ -154,7 +131,6 @@ class PadView(PerViewContactLabels, QGraphicsPathItem):
             p = self.pos()
             self.model.x = p.x()
             self.model.y = p.y()
-            self.update_link()
             self._on_change()
         elif change == QGraphicsItem.ItemSelectedHasChanged:
             self._refresh_style()

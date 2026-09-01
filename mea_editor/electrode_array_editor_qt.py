@@ -15,7 +15,7 @@ Architecture overview
 
 Electrodes and pads share the same scene, shown in two side-by-side
 mapping views: the left view fits the electrodes, the right view fits the pads.
-Each contact keeps a label copy per camera so zooming one view does not move text in the other.
+Each contact stores map-label text drawn by the mapping view overlay.
 Each contact uses a SpikeInterface shape (circle, square, or rect).
 Pads are interfaces toward other electronic systems and each pad is
 linked to one electrode. Orientation markers are unlinked white fiducials (circle, square, or rect)
@@ -40,7 +40,6 @@ try:
         QFormLayout,
         QFrame,
         QGraphicsItem,
-        QGraphicsScene,
         QGraphicsView,
         QGroupBox,
         QHBoxLayout,
@@ -142,11 +141,16 @@ APP_NAME = "Electrode Array Editor"
 # Fit-view framing behavior.
 FIT_PADDING_MIN = 80.0
 FIT_PADDING_RATIO = 0.2
+# Scene margin as a multiple of the array span, so a fitted view can zoom
+# out and pan instead of sitting locked to sceneRect.
+SCENE_FIT_GROW = 8.0
 TAB_ELECTRODES = 0
 TAB_PADS = 1
 TAB_MARKERS = 2
 MIXED_SHAPE_LABEL = "(mixed)"
 NEW_ARRAY_WARN_COUNT = 1024
+# Skip per-item inspector work when a rubber-band selects this many contacts.
+LARGE_SELECTION_PANEL = 64
 
 
 @dataclass(frozen=True)
@@ -210,9 +214,17 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._auto_selected_pad_ids: set[int] = set()
         self._clean_state: EditorState | None = None
         self._electrode_table_window: ElectrodeTableWindow | None = None
+        self._visuals_refresh_pending = False
+        self._panel_refresh_pending = False
+        self._axes_cache: dict[int, tuple[list[float], list[float]]] = {}
+        self._pad_link_cache: list[tuple[float, float, float, float]] | None = None
+        self._pad_combo_sig: tuple | None = None
+        self._pad_add_combo_sig: tuple | None = None
+        self._defer_rubber_band_selection = False
 
         self.scene = GridScene(self)
         self.scene.set_axes_provider(self._grid_axes)
+        self.scene.set_pad_link_provider(self._pad_link_segments)
         self.scene.selectionChanged.connect(self._on_scene_selection_changed)
         self.electrode_view = self._create_map_view()
         self.pads_map_view = self._create_map_view()
@@ -286,6 +298,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
         )
         view.set_delete_callback(self._delete_selected)
         view.set_view_transform_changed_callback(self._refresh_label_layouts)
+        view.set_rubber_band_callbacks(
+            self._on_rubber_band_started,
+            self._on_rubber_band_finished,
+        )
         view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         return view
 
@@ -921,6 +937,22 @@ class ElectrodeArrayEditorQt(QMainWindow):
             "Wireless Neural Interface Team</p>",
         )
 
+    def _classified_selected_items(
+        self,
+    ) -> tuple[list[ElectrodeView], list[PadView], list[OrientationMarkerView]]:
+        """One pass over the scene selection, split by item type."""
+        electrodes: list[ElectrodeView] = []
+        pads: list[PadView] = []
+        markers: list[OrientationMarkerView] = []
+        for item in self.scene.selectedItems():
+            if isinstance(item, ElectrodeView):
+                electrodes.append(item)
+            elif isinstance(item, PadView):
+                pads.append(item)
+            elif isinstance(item, OrientationMarkerView):
+                markers.append(item)
+        return electrodes, pads, markers
+
     def _selected_electrode_items(self) -> list[ElectrodeView]:
         """Return currently selected items, filtered to ElectrodeView."""
         return [it for it in self.scene.selectedItems() if isinstance(it, ElectrodeView)]
@@ -935,10 +967,26 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def _on_scene_selection_changed(self) -> None:
         """Keep associated pads and electrodes selected together, then refresh the panel."""
-        if self._is_mutating_scene or self._is_adding():
+        if self._is_mutating_scene or self._is_adding() or self._is_syncing_selection:
+            return
+        if self._defer_rubber_band_selection:
             return
         self._sync_associated_selection()
-        self._refresh_panel_values()
+        self._schedule_panel_refresh()
+
+    def _on_rubber_band_started(self) -> None:
+        """Do not sync pads/electrodes or rebuild the inspector while the band grows."""
+        self._defer_rubber_band_selection = True
+
+    def _on_rubber_band_finished(self) -> None:
+        """Apply associated selection and the inspector once the drag ends."""
+        if not self._defer_rubber_band_selection:
+            return
+        self._defer_rubber_band_selection = False
+        if self._is_mutating_scene or self._is_adding() or self._is_syncing_selection:
+            return
+        self._sync_associated_selection()
+        self._schedule_panel_refresh()
 
     def _sync_associated_selection(self) -> None:
         """Select each pad's electrode and each electrode's pad; drop stale auto-selections."""
@@ -946,16 +994,19 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return
         self._is_syncing_selection = True
         try:
-            self._sync_associated_electrodes_from_pads()
-            self._sync_associated_pads_from_electrodes()
+            _electrodes, pads, _markers = self._classified_selected_items()
+            self._sync_associated_electrodes_from_pads(pads)
+            electrodes, _pads, _markers = self._classified_selected_items()
+            self._sync_associated_pads_from_electrodes(electrodes)
         finally:
             self._is_syncing_selection = False
 
-    def _sync_associated_electrodes_from_pads(self) -> None:
+    def _sync_associated_electrodes_from_pads(self, pad_items: list[PadView] | None = None) -> None:
         """Select each pad's electrode; drop auto-selected electrodes that are no longer needed."""
+        selected_pads = pad_items if pad_items is not None else self._selected_pad_items()
         needed = {
             item.model.electrode_eid
-            for item in self._selected_pad_items()
+            for item in selected_pads
             if item.model.electrode_eid in self.items
         }
         stale = {eid for eid in self._auto_selected_electrode_eids if eid not in needed}
@@ -968,9 +1019,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.items[eid].setSelected(True)
             self._auto_selected_electrode_eids.add(eid)
 
-    def _sync_associated_pads_from_electrodes(self) -> None:
+    def _sync_associated_pads_from_electrodes(self, electrode_items: list[ElectrodeView] | None = None) -> None:
         """Select each electrode's pad; drop auto-selected pads that are no longer needed."""
-        selected_eids = {item.model.eid for item in self._selected_electrode_items()}
+        selected_eids = {
+            item.model.eid
+            for item in (electrode_items if electrode_items is not None else self._selected_electrode_items())
+        }
         needed = {
             pad_id
             for pad_id, pad in self.pads.items()
@@ -1192,6 +1246,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def _grid_axes(self, view=None) -> tuple[list[float], list[float]]:
         """Return sorted unique X/Y coordinates for grid and axes of one mapping view."""
+        key = id(view)
+        cached = self._axes_cache.get(key)
+        if cached is not None:
+            return cached
         if view is self.pads_map_view and (self.pads or self.orientation_markers):
             models = list(self.pads.values()) + list(self.orientation_markers.values())
         elif view is self.electrode_view and (self.electrodes or self.orientation_markers):
@@ -1202,9 +1260,28 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 + list(self.pads.values())
                 + list(self.orientation_markers.values())
             )
-        xs = {round(model.x, 6) for model in models}
-        ys = {round(model.y, 6) for model in models}
-        return sorted(xs), sorted(ys)
+        xs = sorted({round(model.x, 6) for model in models})
+        ys = sorted({round(model.y, 6) for model in models})
+        self._axes_cache[key] = (xs, ys)
+        return xs, ys
+
+    def _pad_link_segments(self) -> list[tuple[float, float, float, float]]:
+        """Cached pad-to-electrode segments for the pad mapping overlay."""
+        if self._pad_link_cache is not None:
+            return self._pad_link_cache
+        segments: list[tuple[float, float, float, float]] = []
+        for pad in self.pads.values():
+            electrode = self.electrodes.get(pad.electrode_eid)
+            if electrode is None:
+                continue
+            segments.append((pad.x, pad.y, electrode.x, electrode.y))
+        self._pad_link_cache = segments
+        return segments
+
+    def _invalidate_geometry_caches(self) -> None:
+        """Drop axis and link caches after positions or membership change."""
+        self._axes_cache.clear()
+        self._pad_link_cache = None
 
     def _models_bounds_rect(self, models, margin: float = 0.0) -> QRectF:
         """Bounding rect of contact models (center + half-extents)."""
@@ -1339,6 +1416,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self._add_pad_item(pad)
             for marker in orientation_markers:
                 self._add_marker_item(marker)
+            self.scene.has_orientation_markers = bool(self.orientation_markers)
+            self._invalidate_geometry_caches()
+            self._pad_combo_sig = None
+            self._pad_add_combo_sig = None
             self._ensure_scene_rect(extra=visible if not visible.isNull() else None)
             self._restore_map_cameras(cameras)
         finally:
@@ -1357,14 +1438,13 @@ class ElectrodeArrayEditorQt(QMainWindow):
         item = ElectrodeView(
             model,
             self._on_scene_visuals_changed,
-            self._refresh_panel_values,
+            self._schedule_panel_refresh,
             self._labels_for_electrode,
         )
         self.scene.addItem(item)
         self.electrodes[model.eid] = model
         self.items[model.eid] = item
         item.setFlag(QGraphicsItem.ItemIsSelectable, not self._is_adding())
-        item._layout_labels()
         return item
 
     def _add_pad_item(self, pad: Pad) -> PadView:
@@ -1372,17 +1452,15 @@ class ElectrodeArrayEditorQt(QMainWindow):
         item = PadView(
             pad,
             self._on_scene_visuals_changed,
-            self._refresh_panel_values,
+            self._schedule_panel_refresh,
             self.electrodes.get,
             self._labels_for_electrode,
         )
         self.scene.addItem(item)
-        self.scene.addItem(item.link_item)
         self.pads[pad.pad_id] = pad
         self.pad_items[pad.pad_id] = item
         item.setFlag(QGraphicsItem.ItemIsSelectable, not self._is_adding())
         item.update_link()
-        item._layout_labels()
         return item
 
     def _add_marker_item(self, marker: OrientationMarker) -> OrientationMarkerView:
@@ -1390,11 +1468,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
         item = OrientationMarkerView(
             marker,
             self._on_scene_visuals_changed,
-            self._refresh_panel_values,
+            self._schedule_panel_refresh,
         )
         self.scene.addItem(item)
         self.orientation_markers[marker.marker_id] = marker
         self.marker_items[marker.marker_id] = item
+        self.scene.has_orientation_markers = True
         item.setFlag(QGraphicsItem.ItemIsSelectable, not self._is_adding())
         return item
 
@@ -1449,15 +1528,29 @@ class ElectrodeArrayEditorQt(QMainWindow):
     ) -> None:
         """Rebuild the associated-electrode combo: none, free electrodes, current link(s)."""
         combo = self.pad_electrode_combo
+        keep = set(keep_eids or ())
+        if selected_eid is not None and selected_eid in self.electrodes:
+            keep.add(selected_eid)
+        eids = tuple(self._free_electrode_eids(extra=keep))
+        sig = (eids, mixed)
+        if sig == self._pad_combo_sig and combo.count() > 0:
+            combo.blockSignals(True)
+            if mixed:
+                combo.setCurrentIndex(0)
+            elif selected_eid is not None and selected_eid in self.electrodes:
+                idx = combo.findData(selected_eid)
+                combo.setCurrentIndex(idx if idx >= 0 else 0)
+            else:
+                combo.setCurrentIndex(combo.findData(-1))
+            combo.blockSignals(False)
+            return
+        self._pad_combo_sig = sig
         combo.blockSignals(True)
         combo.clear()
         if mixed:
             combo.addItem("(mixed)", None)
         combo.addItem("(none)", -1)
-        keep = set(keep_eids or ())
-        if selected_eid is not None and selected_eid in self.electrodes:
-            keep.add(selected_eid)
-        for eid in self._free_electrode_eids(extra=keep):
+        for eid in eids:
             combo.addItem(self._electrode_combo_label(self.electrodes[eid]), eid)
         if mixed:
             combo.setCurrentIndex(0)
@@ -1471,10 +1564,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
     def _refresh_pad_add_electrode_combo(self) -> None:
         """Rebuild the Add Pad list with electrodes that do not already have a pad."""
         combo = self.pad_add_electrode_combo
+        eids = tuple(self._free_electrode_eids())
+        if eids == self._pad_add_combo_sig and combo.count() == len(eids):
+            return
+        self._pad_add_combo_sig = eids
         current = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
-        for eid in self._free_electrode_eids():
+        for eid in eids:
             combo.addItem(self._electrode_combo_label(self.electrodes[eid]), eid)
         if current is not None:
             idx = combo.findData(current)
@@ -2514,12 +2611,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
     def _update_duplicate_flags(self) -> None:
         """Recompute identifier and pairing flags, then refresh colors."""
         refresh_status_flags(self.electrodes.values(), self.pads.values(), self.attribute_schema)
+        self._invalidate_geometry_caches()
+        self._pad_combo_sig = None
+        self._pad_add_combo_sig = None
         for item in self.items.values():
             item._refresh_style()
         for item in self.pad_items.values():
             item._refresh_style()
             item._refresh_label()
-            item.update_link()
 
     def _states_equal(self, a: EditorState, b: EditorState) -> bool:
         """Compare two snapshots with tolerance on floats."""
@@ -2627,17 +2726,47 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Refresh panel and overlays when geometry/selection changes."""
         if self._is_restoring_state or self._is_mutating_scene:
             return
+        if self._visuals_refresh_pending:
+            return
+        self._visuals_refresh_pending = True
+        QTimer.singleShot(0, self._flush_scene_visuals)
+
+    def _flush_scene_visuals(self) -> None:
+        """Apply one batched scene/panel refresh after geometry changes."""
+        if not self._visuals_refresh_pending:
+            return
+        self._visuals_refresh_pending = False
+        self._panel_refresh_pending = False
+        if self._is_restoring_state or self._is_mutating_scene:
+            return
+        self._invalidate_geometry_caches()
         self._refresh_panel_values()
         self._ensure_scene_rect()
-        for item in self.pad_items.values():
-            item.update_link()
         self._sync_electrode_table(reload_data=True)
-        self.scene.invalidate(
-            self.scene.sceneRect(),
-            QGraphicsScene.BackgroundLayer | QGraphicsScene.ForegroundLayer,
-        )
         self.electrode_view.viewport().update()
         self.pads_map_view.viewport().update()
+
+    def _schedule_panel_refresh(self) -> None:
+        """Rebuild the inspector once after a burst of selection changes."""
+        if (
+            self._is_restoring_state
+            or self._is_mutating_scene
+            or self._is_adding()
+            or self._defer_rubber_band_selection
+        ):
+            return
+        if self._panel_refresh_pending:
+            return
+        self._panel_refresh_pending = True
+        QTimer.singleShot(0, self._flush_panel_refresh)
+
+    def _flush_panel_refresh(self) -> None:
+        if not self._panel_refresh_pending:
+            return
+        self._panel_refresh_pending = False
+        if self._is_restoring_state or self._is_mutating_scene or self._is_adding():
+            return
+        self._refresh_panel_values()
 
     def _undo_line_edit_if_focused(self) -> bool:
         focus = QApplication.focusWidget()
@@ -2715,16 +2844,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self._commit_if_changed(before)
 
     def _refresh_label_layouts(self, view=None) -> None:
-        """Refresh label copies for one camera, or both when `view` is None."""
-        view_attr = None
-        if view is self.electrode_view:
-            view_attr = "electrode_map_view"
-        elif view is self.pads_map_view:
-            view_attr = "pad_map_view"
-        for item in self.items.values():
-            item._layout_labels(view_attr)
-        for item in self.pad_items.values():
-            item._layout_labels(view_attr)
+        """Redraw overlay labels after zoom, pan, or a fit-view."""
+        if view is not None:
+            view.viewport().update()
+            return
+        self.electrode_view.viewport().update()
+        self.pads_map_view.viewport().update()
 
     def _fit_target_rect(self, index: int) -> QRectF:
         """Bounds used to frame a mapping view (electrodes left, pads right)."""
@@ -2771,7 +2896,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return
         array_rect = self._array_bounds_rect(margin=0.0)
         span = max(array_rect.width(), array_rect.height(), 1.0)
-        margin = max(DEFAULT_SCENE_MARGIN, FIT_PADDING_MIN * 2.0, span)
+        margin = max(DEFAULT_SCENE_MARGIN, FIT_PADDING_MIN * 2.0, span * SCENE_FIT_GROW)
         rect = self._array_bounds_rect(margin=margin)
         if extra is not None:
             rect = rect.united(extra)
@@ -2787,7 +2912,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Fit one mapping viewport to a scene rect, centered in the plot area."""
         fit_padding = max(FIT_PADDING_MIN, FIT_PADDING_RATIO * max(base_rect.width(), base_rect.height()))
         fit_rect = base_rect.adjusted(-fit_padding, -fit_padding, fit_padding, fit_padding)
-        grow = max(fit_rect.width(), fit_rect.height())
+        grow = max(fit_rect.width(), fit_rect.height()) * SCENE_FIT_GROW
         self._ensure_scene_rect(extra=fit_rect.adjusted(-grow, -grow, grow, grow))
         view.fit_scene_rect(fit_rect)
 
@@ -2827,6 +2952,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
             item._refresh_label()
         for item in self.pad_items.values():
             item._refresh_label()
+        self._refresh_label_layouts()
 
     def _rebuild_map_label_controls(self) -> None:
         """Rebuild checkbox and View-menu entries from the current schema."""
@@ -3123,11 +3249,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
         except ValueError:
             QMessageBox.critical(self, "Invalid dX/dY", "dX and dY must be numeric values.")
             return
-        for item in electrodes + pads + markers:
-            p = item.pos()
-            item.setPos(p.x() + dx, p.y() + dy)
-        self._refresh_panel_values()
-        self._sync_electrode_table(reload_data=True)
+        self._is_mutating_scene = True
+        try:
+            for item in electrodes + pads + markers:
+                p = item.pos()
+                item.setPos(p.x() + dx, p.y() + dy)
+        finally:
+            self._is_mutating_scene = False
+        self._on_scene_visuals_changed()
         self._commit_if_changed(before)
 
     def _delete_selected_electrodes(self) -> None:
@@ -3425,9 +3554,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         Electrode, pad, and orientation-marker tabs are filled independently.
         A homogeneous selection switches to the matching parameterization tab.
         """
-        electrodes = self._selected_electrode_items()
-        pads = self._selected_pad_items()
-        markers = self._selected_marker_items()
+        electrodes, pads, markers = self._classified_selected_items()
         self.selected_count_label.setText(
             f"{len(electrodes)} electrode(s), {len(pads)} pad(s), {len(markers)} marker(s)"
         )
@@ -3506,6 +3633,30 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self.label_orientation_combo, m.label_orientation, mixed=False
             )
             self._fill_attribute_edits([m])
+            return
+
+        if len(selected) > LARGE_SELECTION_PANEL:
+            self.radius_edit.setText("")
+            self.height_edit.setText("")
+            self.x_edit.setText("")
+            self.y_edit.setText("")
+            self.contact_plane_axis_edit.setText("")
+            self._set_shape_combo(self.shape_combo, ELECTRODE_SHAPES, DEFAULT_SHAPE, mixed=True)
+            self._electrode_size_shape = MIXED_SHAPE_LABEL
+            self.electrode_size_label.setText("Size")
+            self._set_label_position_combo(
+                self.label_position_combo, DEFAULT_LABEL_POSITION, mixed=True
+            )
+            self._set_label_orientation_combo(
+                self.label_orientation_combo, DEFAULT_LABEL_ORIENTATION, mixed=True
+            )
+            self._set_height_row_visible(
+                self._electrode_geom_form,
+                self.electrode_height_label,
+                self.height_edit,
+                False,
+            )
+            self._fill_attribute_edits([])
             return
 
         if len(selected) > 1:
@@ -3607,6 +3758,36 @@ class ElectrodeArrayEditorQt(QMainWindow):
             )
             return
 
+        if len(selected) > LARGE_SELECTION_PANEL:
+            self.pad_radius_edit.setText("")
+            self.pad_height_edit.setText("")
+            self.pad_x_edit.setText("")
+            self.pad_y_edit.setText("")
+            self.pad_id_edit.setText("")
+            self._set_shape_combo(self.pad_shape_combo, PAD_SHAPES, DEFAULT_PAD_SHAPE, mixed=True)
+            self._pad_size_shape = MIXED_SHAPE_LABEL
+            self.pad_size_label.setText("Size")
+            self._set_label_position_combo(
+                self.pad_label_position_combo, DEFAULT_LABEL_POSITION, mixed=True
+            )
+            self._set_label_orientation_combo(
+                self.pad_label_orientation_combo, DEFAULT_LABEL_ORIENTATION, mixed=True
+            )
+            self._set_height_row_visible(
+                self._pad_form,
+                self.pad_height_label,
+                self.pad_height_edit,
+                False,
+            )
+            combo = self.pad_electrode_combo
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(mixed)", None)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+            self._pad_combo_sig = None
+            return
+
         if len(selected) > 1:
             sizes = [size_field_from_stored_half(it.model.shape, it.model.radius) for it in selected]
             eids = [it.model.electrode_eid for it in selected]
@@ -3701,6 +3882,25 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.marker_id_edit.setText(str(m.marker_id))
             self.marker_x_edit.setText(f"{m.x:.2f}")
             self.marker_y_edit.setText(f"{m.y:.2f}")
+            return
+
+        if len(selected) > LARGE_SELECTION_PANEL:
+            self.marker_radius_edit.setText("")
+            self.marker_height_edit.setText("")
+            self.marker_x_edit.setText("")
+            self.marker_y_edit.setText("")
+            self.marker_id_edit.setText("")
+            self._set_shape_combo(
+                self.marker_shape_combo, MARKER_SHAPES, DEFAULT_MARKER_SHAPE, mixed=True
+            )
+            self._marker_size_shape = MIXED_SHAPE_LABEL
+            self.marker_size_label.setText("Size")
+            self._set_height_row_visible(
+                self._marker_form,
+                self.marker_height_label,
+                self.marker_height_edit,
+                False,
+            )
             return
 
         if len(selected) > 1:
