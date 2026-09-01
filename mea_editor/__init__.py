@@ -2,7 +2,8 @@
 MEA Editor - GUI and library to create and modify MEA arrays.
 
 Native files use mea_editor JSON. SpikeInterface export writes probeinterface JSON.
-XLSX exports cover analysis tables and the full electrode + pad workbook.
+XLSX exports cover analysis tables and the full electrode + pad + orientation-marker
+workbook.
 
 The Qt GUI is imported lazily so I/O and library use do not require a working
 PySide6 display.
@@ -26,6 +27,7 @@ from .electrode_array_editor_io import (
     save_array_to_file,
     save_electrodes_to_file,
 )
+from .orientation_marker import OrientationMarker, OrientationMarkerSnapshot
 from .pad import Pad, PadSnapshot
 
 if TYPE_CHECKING:
@@ -37,6 +39,8 @@ __all__ = [
     "AttributeSpec",
     "Electrode",
     "ElectrodeSnapshot",
+    "OrientationMarker",
+    "OrientationMarkerSnapshot",
     "Pad",
     "PadSnapshot",
     "default_schema",

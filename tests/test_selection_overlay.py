@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
 from mea_editor.electrode import Electrode
 from mea_editor.electrode_array_view import _option_without_qt_selection
 from mea_editor.electrode_view import ElectrodeView
+from mea_editor.orientation_marker import OrientationMarker
+from mea_editor.orientation_marker_view import OrientationMarkerView
 from mea_editor.pad import Pad
 from mea_editor.pad_view import PadView
 
@@ -43,6 +45,11 @@ class SelectionOverlayTests(unittest.TestCase):
         scene.addItem(pad_item)
         pad_item.setSelected(True)
 
+        marker = OrientationMarker(marker_id=1, x=20.0, y=0.0, side=16.0)
+        marker_item = OrientationMarkerView(marker, lambda: None, lambda: None)
+        scene.addItem(marker_item)
+        marker_item.setSelected(True)
+
         image = QImage(64, 64, QImage.Format_ARGB32)
         painter = QPainter(image)
         option = QStyleOptionGraphicsItem()
@@ -50,4 +57,5 @@ class SelectionOverlayTests(unittest.TestCase):
         option.exposedRect = item.boundingRect()
         item.paint(painter, option, None)
         pad_item.paint(painter, option, None)
+        marker_item.paint(painter, option, None)
         painter.end()

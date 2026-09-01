@@ -1,5 +1,5 @@
 """
-Shared map-view colors for electrodes and pads.
+Shared map-view colors for electrodes, pads, and orientation markers.
 
 Fill colors vary by `shank_id` so contacts on the same shank stay visually
 grouped: blues for electrodes, purples for pads. Consecutive shanks use
@@ -20,6 +20,8 @@ except ImportError as exc:
 
 ELECTRODE_DEFAULT_FILL = QColor("#3da5ff")
 PAD_DEFAULT_FILL = QColor("#c77dff")
+ORIENTATION_MARKER_FILL = QColor("#ffffff")
+ORIENTATION_MARKER_OUTLINE = QColor("#8a9bb0")
 
 LABEL_ON_DARK = QColor("#ffffff")
 LABEL_ON_LIGHT = QColor("#0c1420")

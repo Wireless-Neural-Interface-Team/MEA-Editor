@@ -10,6 +10,7 @@ This module intentionally stays minimal:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -25,8 +26,106 @@ DEFAULT_PLANE_AXIS = (1.0, 0.0, 0.0, 1.0)
 BUILTIN_ATTRIBUTE_KEYS = ("potentiostat_id", "intan_id", "manufacturer_id", "shank_id")
 DEFAULT_MAP_LABEL_KEYS = ("potentiostat_id", "intan_id", "shank_id")
 _CENTER_MAP_LABEL_KEYS = frozenset({"potentiostat_id", "shank_id"})
+LABEL_POSITIONS = ("above", "below", "left", "right")
+DEFAULT_LABEL_POSITION = "below"
+LABEL_POSITION_GAP = 4.0
+LABEL_POSITION_CAPTIONS = {
+    "above": "Above",
+    "below": "Below",
+    "left": "Left",
+    "right": "Right",
+}
+LABEL_ORIENTATIONS = (0, 90, 180, 270)
+DEFAULT_LABEL_ORIENTATION = 0
+LABEL_ORIENTATION_CAPTIONS = {
+    0: "0°",
+    90: "90°",
+    180: "180°",
+    270: "270°",
+}
+_LABEL_ORIENTATION_ALIASES = {
+    "horizontal": 0,
+    "vertical": 90,
+}
 
 AttrValue = str | int | float
+
+
+def normalize_label_position(value: object) -> str:
+    """Return a supported map-label side, or `below` when the value is unknown."""
+    text = str(value).strip().lower() if value is not None else ""
+    if text in LABEL_POSITIONS:
+        return text
+    return DEFAULT_LABEL_POSITION
+
+
+def normalize_label_orientation(value: object) -> int:
+    """Return 0 / 90 / 180 / 270 degrees, or 0 when the value is unknown."""
+    if value is None or isinstance(value, bool):
+        return DEFAULT_LABEL_ORIENTATION
+    if isinstance(value, (int, float)):
+        degrees = int(round(float(value))) % 360
+        return degrees if degrees in LABEL_ORIENTATIONS else DEFAULT_LABEL_ORIENTATION
+    text = str(value).strip().lower().replace("°", "")
+    text = text.replace("degrees", "").replace("deg", "").strip()
+    if text in _LABEL_ORIENTATION_ALIASES:
+        return _LABEL_ORIENTATION_ALIASES[text]
+    try:
+        degrees = int(round(float(text))) % 360
+    except (TypeError, ValueError):
+        return DEFAULT_LABEL_ORIENTATION
+    return degrees if degrees in LABEL_ORIENTATIONS else DEFAULT_LABEL_ORIENTATION
+
+
+def rotated_label_item_aabb(
+    text_w: float,
+    text_h: float,
+    orientation: int,
+) -> tuple[float, float, float, float]:
+    """
+    Axis-aligned bounds of rotated map text in item coordinates (Y-up).
+
+    Rotation is clockwise in screen space (ItemIgnoresTransformations).
+    Returns (min_x, min_y, max_x, max_y) relative to the unrotated top-left.
+    """
+    degrees = normalize_label_orientation(orientation)
+    rad = math.radians(degrees)
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    xs: list[float] = []
+    ys: list[float] = []
+    for lx, ly in ((0.0, 0.0), (text_w, 0.0), (0.0, text_h), (text_w, text_h)):
+        device_x = cos_a * lx - sin_a * ly
+        device_y = sin_a * lx + cos_a * ly
+        xs.append(device_x)
+        ys.append(-device_y)
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def map_label_item_pos(
+    position: str,
+    half_x: float,
+    half_y: float,
+    text_w: float,
+    text_h: float,
+    gap: float = LABEL_POSITION_GAP,
+    orientation: int = DEFAULT_LABEL_ORIENTATION,
+) -> tuple[float, float]:
+    """
+    Top-left of an outside map label in item coordinates.
+
+    Scene Y grows up. Labels use ItemIgnoresTransformations, so unrotated text
+    extends down on screen from this origin (toward -Y in the scene).
+    `orientation` is clockwise degrees in screen space (0 / 90 / 180 / 270).
+    """
+    min_x, min_y, max_x, max_y = rotated_label_item_aabb(text_w, text_h, orientation)
+    side = normalize_label_position(position)
+    if side == "above":
+        return (-(min_x + max_x) / 2.0, half_y + gap - min_y)
+    if side == "left":
+        return (-(half_x + gap) - max_x, -(min_y + max_y) / 2.0)
+    if side == "right":
+        return (half_x + gap - min_x, -(min_y + max_y) / 2.0)
+    return (-(min_x + max_x) / 2.0, -(half_y + gap) - max_y)
 
 
 def electrode_center_label(potentiostat_id: int, shank_id: str) -> str:
@@ -107,6 +206,8 @@ class ElectrodeSnapshot:
     contact_plane_axis: tuple[float, float, float, float]
     shank_id: str
     shape: str
+    label_position: str
+    label_orientation: int
     extra: dict[str, AttrValue]
 
 
@@ -120,6 +221,8 @@ class Electrode:
     - identification: potentiostat_id, intan_id, manufacturer_id, shank_id
     - extra attributes: file-defined key/value map (`extra`)
     - orientation metadata: contact_plane_axis (x0, x1, y0, y1)
+    - editor display: label_position (above / below / left / right) and
+      label_orientation (0 / 90 / 180 / 270 degrees)
     - editor state: duplicate flags
 
     Notes:
@@ -129,6 +232,8 @@ class Electrode:
     - Duplicate flags are computed by the editor and drive display color.
     - Built-in identifiers are always present; extra attributes live in `extra`
       and follow the file-level schema.
+    - label_position and label_orientation are editor display only (native
+      JSON); they are omitted from SpikeInterface and XLSX exports.
     """
 
     eid: int
@@ -142,6 +247,8 @@ class Electrode:
     contact_plane_axis: tuple[float, float, float, float] = DEFAULT_PLANE_AXIS
     shank_id: str = ""
     shape: str = DEFAULT_SHAPE
+    label_position: str = DEFAULT_LABEL_POSITION
+    label_orientation: int = DEFAULT_LABEL_ORIENTATION
     extra: dict[str, AttrValue] = field(default_factory=dict)
     has_potentiostat_duplicate: bool = False
     has_intan_duplicate: bool = False
@@ -163,6 +270,8 @@ class Electrode:
             contact_plane_axis=self.contact_plane_axis,
             shank_id=self.shank_id,
             shape=self.shape,
+            label_position=self.label_position,
+            label_orientation=self.label_orientation,
             extra=dict(self.extra),
         )
 
@@ -178,6 +287,8 @@ class Electrode:
         self.contact_plane_axis = snap.contact_plane_axis
         self.shank_id = snap.shank_id
         self.shape = snap.shape
+        self.label_position = snap.label_position
+        self.label_orientation = snap.label_orientation
         self.extra = dict(snap.extra)
 
     @classmethod
@@ -195,6 +306,8 @@ class Electrode:
             contact_plane_axis=snap.contact_plane_axis,
             shank_id=snap.shank_id,
             shape=snap.shape,
+            label_position=snap.label_position,
+            label_orientation=snap.label_orientation,
             extra=dict(snap.extra),
         )
 

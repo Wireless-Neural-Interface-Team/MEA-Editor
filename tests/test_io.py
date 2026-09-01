@@ -24,6 +24,7 @@ from mea_editor.electrode_array_editor_io import (
     load_array_from_file,
     save_array_to_file,
 )
+from mea_editor.orientation_marker import OrientationMarker
 from mea_editor.pad import Pad
 
 
@@ -137,11 +138,21 @@ class IoRoundTripTests(unittest.TestCase):
         self.assertEqual(loaded_pads[0].shape, "rect")
         self.assertEqual(loaded_pads[0].height, 4.0)
         self.assertEqual(payload["pads"][0]["pad_id"], 1)
+        self.assertEqual(payload["orientation_markers"], [])
+        self.assertEqual(document.orientation_markers, [])
         self.assertNotIn("enabled", payload["electrodes"][0])
         self.assertNotIn("enabled", payload["pads"][0])
         self.assertNotIn("pid", payload["pads"][0])
         self.assertNotIn("interface_id", payload["pads"][0])
         self.assertNotIn("system_id", payload["pads"][0])
+        self.assertEqual(payload["electrodes"][0]["label_position"], "below")
+        self.assertEqual(payload["pads"][0]["label_position"], "below")
+        self.assertEqual(payload["electrodes"][0]["label_orientation"], 0)
+        self.assertEqual(payload["pads"][0]["label_orientation"], 0)
+        self.assertEqual(loaded[0].label_position, "below")
+        self.assertEqual(loaded_pads[0].label_position, "below")
+        self.assertEqual(loaded[0].label_orientation, 0)
+        self.assertEqual(loaded_pads[0].label_orientation, 0)
 
     def test_legacy_native_without_map_labels_uses_defaults(self) -> None:
         payload = {
@@ -163,6 +174,9 @@ class IoRoundTripTests(unittest.TestCase):
             Path(path).write_text(json.dumps(payload), encoding="utf-8")
             document = load_array_document(path)
         self.assertEqual(document.map_labels, list(DEFAULT_MAP_LABEL_KEYS))
+        self.assertEqual(document.orientation_markers, [])
+        self.assertEqual(document.electrodes[0].label_position, "below")
+        self.assertEqual(document.electrodes[0].label_orientation, 0)
 
     def test_empty_map_labels_are_preserved(self) -> None:
         electrodes, pads, schema = _sample_array()
@@ -401,7 +415,9 @@ class IoRoundTripTests(unittest.TestCase):
 
             workbook = load_workbook(array_path)
             try:
-                self.assertEqual(workbook.sheetnames, ["array", "pads", "electrode_attributes"])
+                self.assertEqual(workbook.sheetnames, ["array", "pads", "orientation_markers", "electrode_attributes"])
+                self.assertEqual(workbook["orientation_markers"]["A1"].value, "marker_id")
+                self.assertIsNone(workbook["orientation_markers"]["A2"].value)
                 self.assertEqual(workbook["pads"]["A1"].value, "pad_id")
                 self.assertEqual(workbook["pads"]["A2"].value, 1)
                 self.assertEqual(workbook["pads"]["E1"].value, "si_channel")
@@ -463,6 +479,191 @@ class IoRoundTripTests(unittest.TestCase):
                 workbook.close()
 
 
+    def test_orientation_markers_roundtrip_and_xlsx_only(self) -> None:
+        electrodes, pads, schema = _sample_array()
+        markers = [
+            OrientationMarker(marker_id=2, x=-50.0, y=80.0, side=30.0),
+            OrientationMarker(marker_id=0, x=100.0, y=-10.0, side=12.0),
+        ]
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            native_path = str(Path(tmp) / "array.json")
+            si_path = str(Path(tmp) / "probe.json")
+            analysis_path = str(Path(tmp) / "analysis.xlsx")
+            array_path = str(Path(tmp) / "array.xlsx")
+            save_array_to_file(
+                native_path,
+                electrodes,
+                "um",
+                pads=pads,
+                electrode_attributes=schema,
+                orientation_markers=markers,
+            )
+            payload = json.loads(Path(native_path).read_text(encoding="utf-8"))
+            self.assertEqual(
+                [item["marker_id"] for item in payload["orientation_markers"]],
+                [0, 2],
+            )
+            self.assertEqual(payload["orientation_markers"][1]["side"], 30.0)
+            self.assertEqual(payload["orientation_markers"][1]["label_position"], "below")
+            self.assertEqual(payload["orientation_markers"][1]["label_orientation"], 0)
+            document = load_array_document(native_path)
+            self.assertEqual([m.marker_id for m in document.orientation_markers], [0, 2])
+            self.assertEqual(document.orientation_markers[1].x, -50.0)
+            self.assertEqual(document.orientation_markers[1].side, 30.0)
+
+            export_spikeinterface_json(
+                si_path,
+                electrodes,
+                "um",
+                pads=pads,
+                electrode_attributes=schema,
+            )
+            si_payload = json.loads(Path(si_path).read_text(encoding="utf-8"))
+            dumped = json.dumps(si_payload)
+            self.assertNotIn("orientation_marker", dumped)
+            self.assertNotIn("marker_id", dumped)
+            self.assertNotIn("label_position", dumped)
+            self.assertNotIn("label_orientation", dumped)
+
+            export_analysis_xlsx(
+                analysis_path,
+                electrodes,
+                pads=pads,
+                electrode_attributes=schema,
+                orientation_markers=markers,
+            )
+            export_array_xlsx(
+                array_path,
+                electrodes,
+                pads=pads,
+                electrode_attributes=schema,
+                orientation_markers=markers,
+            )
+            from openpyxl import load_workbook
+
+            analysis = load_workbook(analysis_path)
+            try:
+                self.assertEqual(analysis.sheetnames, ["array", "orientation_markers"])
+                sheet = analysis["orientation_markers"]
+                self.assertEqual(
+                    [cell.value for cell in sheet[1]],
+                    ["marker_id", "x", "y", "side"],
+                )
+                self.assertEqual(sheet["A2"].value, 0)
+                self.assertEqual(sheet["B2"].value, 100.0)
+                self.assertEqual(sheet["D2"].value, 12.0)
+                self.assertEqual(sheet["A3"].value, 2)
+                self.assertEqual(sheet["D3"].value, 30.0)
+            finally:
+                analysis.close()
+
+            workbook = load_workbook(array_path)
+            try:
+                self.assertEqual(
+                    workbook.sheetnames,
+                    ["array", "pads", "orientation_markers", "electrode_attributes"],
+                )
+                self.assertEqual(workbook["orientation_markers"]["A3"].value, 2)
+                self.assertEqual(workbook["orientation_markers"]["C3"].value, 80.0)
+            finally:
+                workbook.close()
+
+    def test_label_position_is_native_only(self) -> None:
+        electrodes, pads, schema = _sample_array()
+        electrodes[0].label_position = "left"
+        electrodes[0].label_orientation = 90
+        pads[0].label_position = "right"
+        pads[0].label_orientation = 270
+        markers = [
+            OrientationMarker(
+                marker_id=0,
+                x=5.0,
+                y=6.0,
+                side=16.0,
+                label_position="above",
+                label_orientation=180,
+            ),
+        ]
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            native_path = str(Path(tmp) / "array.json")
+            si_path = str(Path(tmp) / "probe.json")
+            analysis_path = str(Path(tmp) / "analysis.xlsx")
+            array_path = str(Path(tmp) / "array.xlsx")
+            save_array_to_file(
+                native_path,
+                electrodes,
+                "um",
+                pads=pads,
+                electrode_attributes=schema,
+                orientation_markers=markers,
+            )
+            payload = json.loads(Path(native_path).read_text(encoding="utf-8"))
+            self.assertEqual(payload["electrodes"][0]["label_position"], "left")
+            self.assertEqual(payload["electrodes"][0]["label_orientation"], 90)
+            self.assertEqual(payload["pads"][0]["label_position"], "right")
+            self.assertEqual(payload["pads"][0]["label_orientation"], 270)
+            self.assertEqual(payload["orientation_markers"][0]["label_position"], "above")
+            self.assertEqual(payload["orientation_markers"][0]["label_orientation"], 180)
+            document = load_array_document(native_path)
+            self.assertEqual(document.electrodes[0].label_position, "left")
+            self.assertEqual(document.electrodes[0].label_orientation, 90)
+            self.assertEqual(document.pads[0].label_position, "right")
+            self.assertEqual(document.pads[0].label_orientation, 270)
+            self.assertEqual(document.orientation_markers[0].label_position, "above")
+            self.assertEqual(document.orientation_markers[0].label_orientation, 180)
+
+            export_spikeinterface_json(
+                si_path,
+                electrodes,
+                "um",
+                pads=pads,
+                electrode_attributes=schema,
+            )
+            si_text = Path(si_path).read_text(encoding="utf-8")
+            self.assertNotIn("label_position", si_text)
+            self.assertNotIn("label_orientation", si_text)
+
+            export_analysis_xlsx(
+                analysis_path,
+                electrodes,
+                pads=pads,
+                electrode_attributes=schema,
+                orientation_markers=markers,
+            )
+            export_array_xlsx(
+                array_path,
+                electrodes,
+                pads=pads,
+                electrode_attributes=schema,
+                orientation_markers=markers,
+            )
+            from openpyxl import load_workbook
+
+            analysis = load_workbook(analysis_path)
+            try:
+                analysis_headers = [cell.value for cell in analysis.active[1]]
+                marker_headers = [cell.value for cell in analysis["orientation_markers"][1]]
+            finally:
+                analysis.close()
+            workbook = load_workbook(array_path)
+            try:
+                array_headers = [cell.value for cell in workbook["array"][1]]
+                pad_headers = [cell.value for cell in workbook["pads"][1]]
+                marker_headers_full = [cell.value for cell in workbook["orientation_markers"][1]]
+            finally:
+                workbook.close()
+        self.assertNotIn("label_position", analysis_headers)
+        self.assertNotIn("label_orientation", analysis_headers)
+        self.assertNotIn("label_position", marker_headers)
+        self.assertNotIn("label_orientation", marker_headers)
+        self.assertNotIn("label_position", array_headers)
+        self.assertNotIn("label_orientation", array_headers)
+        self.assertNotIn("label_position", pad_headers)
+        self.assertNotIn("label_orientation", pad_headers)
+        self.assertNotIn("label_position", marker_headers_full)
+        self.assertNotIn("label_orientation", marker_headers_full)
+
+
 class VersionTests(unittest.TestCase):
     def test_package_version_is_semver(self) -> None:
         parts = __version__.split(".")
@@ -470,7 +671,7 @@ class VersionTests(unittest.TestCase):
         self.assertTrue(all(part.isdigit() for part in parts))
 
     def test_native_format_version(self) -> None:
-        self.assertEqual(NATIVE_VERSION, "1.7")
+        self.assertEqual(NATIVE_VERSION, "1.10")
 
     def test_version_module_matches_package(self) -> None:
         from mea_editor._version import __version__ as raw

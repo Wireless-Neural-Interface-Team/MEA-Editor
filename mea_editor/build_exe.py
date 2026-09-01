@@ -44,6 +44,8 @@ HIDDEN_IMPORTS = (
     "mea_editor.electrode_table_window",
     "mea_editor.electrode_view",
     "mea_editor.grid_scene",
+    "mea_editor.orientation_marker",
+    "mea_editor.orientation_marker_view",
     "mea_editor.pad",
     "mea_editor.pad_layout",
     "mea_editor.pad_view",

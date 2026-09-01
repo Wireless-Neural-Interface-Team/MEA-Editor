@@ -7,6 +7,7 @@ Architecture overview
 - `GridScene`: lightweight scene wrapper exposing dynamic X/Y axes (grid_scene.py)
 - `ElectrodeView`: visual/interactive representation of one `Electrode` (electrode_view.py)
 - `PadView`: visual/interactive representation of one `Pad` (pad_view.py)
+- `OrientationMarkerView`: white square fiducial, not linked to contacts (orientation_marker_view.py)
 - `ElectrodeArrayEditorQt`: main window, business logic, file workflow (this file)
 - `ElectrodeTableWindow`: non-modal table of all electrodes with search/filters
 - `attribute_schema`: file-level extra electrode attributes (this file rebuilds the panel from it)
@@ -17,7 +18,8 @@ mapping views: the left view fits the electrodes, the right view fits the pads.
 Each contact keeps a label copy per camera so zooming one view does not move text in the other.
 Each contact uses a SpikeInterface shape (circle, square, or rect).
 Pads are interfaces toward other electronic systems and each pad is
-linked to one electrode.
+linked to one electrode. Orientation markers are unlinked white squares
+used to read the view orientation; they are not SpikeInterface contacts.
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ except ImportError as exc:
 # Use instead: python run.py (from project root), or mea-editor (when installed).
 from ._version import __version__
 from .array_integrity import (
+    ensure_unique_marker_ids,
     ensure_unique_model_ids,
     pairing_problems,
     refresh_status_flags,
@@ -96,16 +99,30 @@ from .electrode_array_editor_io import (
     save_array_to_file,
 )
 from .electrode import (
+    DEFAULT_LABEL_ORIENTATION,
+    DEFAULT_LABEL_POSITION,
     DEFAULT_MAP_LABEL_KEYS,
     DEFAULT_RADIUS,
     DEFAULT_SHAPE,
     ELECTRODE_SHAPES,
+    LABEL_ORIENTATION_CAPTIONS,
+    LABEL_ORIENTATIONS,
+    LABEL_POSITION_CAPTIONS,
+    LABEL_POSITIONS,
     Electrode,
     ElectrodeSnapshot,
+    normalize_label_orientation,
+    normalize_label_position,
 )
 from .electrode_array_view import ElectrodeArrayView
 from .electrode_view import ElectrodeView
 from .grid_scene import GridScene
+from .orientation_marker import (
+    DEFAULT_MARKER_SIDE,
+    OrientationMarker,
+    OrientationMarkerSnapshot,
+)
+from .orientation_marker_view import OrientationMarkerView
 from .pad import (
     DEFAULT_PAD_RADIUS,
     PAD_SHAPES,
@@ -123,16 +140,18 @@ FIT_PADDING_MIN = 80.0
 FIT_PADDING_RATIO = 0.2
 TAB_ELECTRODES = 0
 TAB_PADS = 1
+TAB_MARKERS = 2
 MIXED_SHAPE_LABEL = "(mixed)"
 NEW_ARRAY_WARN_COUNT = 1024
 
 
 @dataclass(frozen=True)
 class EditorState:
-    """Full editor snapshot for undo/redo (electrodes, pads, schema, labels, units, path)."""
+    """Full editor snapshot for undo/redo (electrodes, pads, markers, schema, labels, units, path)."""
 
     electrodes: dict[int, ElectrodeSnapshot]
     pads: dict[int, PadSnapshot]
+    orientation_markers: dict[int, OrientationMarkerSnapshot]
     attribute_schema: tuple[AttributeSpec, ...]
     map_labels: tuple[str, ...]
     si_units: str
@@ -158,6 +177,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.si_units = "um"
         self.is_add_mode = False
         self.is_add_pad_mode = False
+        self.is_add_marker_mode = False
 
         # Canonical electrode models keyed by eid.
         self.electrodes: dict[int, Electrode] = {}
@@ -166,6 +186,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         # Canonical pad models keyed by pad_id.
         self.pads: dict[int, Pad] = {}
         self.pad_items: dict[int, PadView] = {}
+        self.orientation_markers: dict[int, OrientationMarker] = {}
+        self.marker_items: dict[int, OrientationMarkerView] = {}
         # File-level electrode attribute schema (built-ins + extras).
         self.attribute_schema: list[AttributeSpec] = default_schema()
         self.attribute_edits: dict[str, QLineEdit] = {}
@@ -246,7 +268,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Build a mapping viewport bound to the shared scene."""
         view = ElectrodeArrayView(self.scene)
         view.set_add_callbacks(
-            lambda: self.is_add_mode or self.is_add_pad_mode,
+            lambda: self.is_add_mode or self.is_add_pad_mode or self.is_add_marker_mode,
             self._add_point_at,
         )
         view.set_delete_callback(self._delete_selected)
@@ -261,7 +283,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         The scene shows electrodes and pads together. Two cameras share it,
         side by side: Electrodes (left, fitted to the array) and Pads (right).
         The inspector is grouped by task: array settings, selection, then
-        Electrodes / Pads tabs.
+        Electrodes / Pads / Orientation marker tabs.
         """
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -292,7 +314,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.statusBar().addPermanentWidget(QLabel(f"v{__version__}"))
 
     def _build_side_panel(self) -> QWidget:
-        """Inspector: array, selection, then electrode/pad parameterization."""
+        """Inspector: array, selection, then electrode/pad/marker parameterization."""
         panel = QWidget()
         panel.setMinimumWidth(300)
         panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -307,6 +329,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.point_tabs = QTabWidget()
         self.point_tabs.addTab(self._build_electrode_tab(), "Electrodes")
         self.point_tabs.addTab(self._build_pad_tab(), "Pads")
+        self.point_tabs.addTab(self._build_marker_tab(), "Orientation marker")
         self.point_tabs.currentChanged.connect(self._on_point_tab_changed)
         layout.addWidget(self.point_tabs, stretch=1)
         return panel
@@ -382,10 +405,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
         return box
 
     def _build_selection_group(self) -> QGroupBox:
-        """Selection summary and group translation (electrodes and pads)."""
+        """Selection summary and group translation (electrodes, pads, markers)."""
         box = QGroupBox("Selection")
         form = self._form_layout(box)
-        self.selected_count_label = QLabel("0 electrode(s), 0 pad(s)")
+        self.selected_count_label = QLabel("0 electrode(s), 0 pad(s), 0 marker(s)")
         self.dx_edit = QLineEdit("0")
         self.dy_edit = QLineEdit("0")
         self.dx_edit.setToolTip("Horizontal offset applied to the current selection.")
@@ -440,6 +463,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
         e_form.addRow(self.electrode_height_label, self.height_edit)
         e_form.addRow("X / Y", self._make_row(self.x_edit, self.y_edit))
         e_form.addRow("Contact plane", self.contact_plane_axis_edit)
+        self.label_position_combo = self._make_label_position_combo()
+        e_form.addRow("Label position", self.label_position_combo)
+        self.label_orientation_combo = self._make_label_orientation_combo()
+        e_form.addRow("Label orientation", self.label_orientation_combo)
         self._electrode_geom_form = e_form
         self.shape_combo.currentTextChanged.connect(self._on_electrode_shape_combo_changed)
         self._set_height_row_visible(
@@ -534,6 +561,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
         p_form.addRow(self.pad_height_label, self.pad_height_edit)
         p_form.addRow("X / Y", self._make_row(self.pad_x_edit, self.pad_y_edit))
         p_form.addRow("Associated electrode", self.pad_electrode_combo)
+        self.pad_label_position_combo = self._make_label_position_combo()
+        p_form.addRow("Label position", self.pad_label_position_combo)
+        self.pad_label_orientation_combo = self._make_label_orientation_combo()
+        p_form.addRow("Label orientation", self.pad_label_orientation_combo)
         self._pad_form = p_form
         self.pad_shape_combo.currentTextChanged.connect(self._on_pad_shape_combo_changed)
         self._set_height_row_visible(
@@ -570,6 +601,70 @@ class ElectrodeArrayEditorQt(QMainWindow):
         tools_form.addRow("Electrode for new pad", self.pad_add_electrode_combo)
         tools_form.addRow(self.b_add_pad)
         tools_form.addRow(b_delete_pad)
+        layout.addWidget(tools)
+        return tab
+
+    def _build_marker_tab(self) -> QWidget:
+        """Find, properties, then add/delete actions for orientation markers."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setSpacing(8)
+
+        find_box = QGroupBox("Find")
+        find_form = self._form_layout(find_box)
+        self.marker_id_find_edit = QLineEdit("")
+        self.marker_id_find_edit.setPlaceholderText("e.g. 0")
+        self.marker_id_find_edit.setClearButtonEnabled(True)
+        b_find_marker = QPushButton("Find")
+        b_find_marker.setAutoDefault(False)
+        b_find_marker.clicked.connect(self._find_by_marker_id)
+        self.marker_id_find_edit.returnPressed.connect(self._find_by_marker_id)
+        find_form.addRow("Marker ID", self._make_row(self.marker_id_find_edit, b_find_marker))
+        layout.addWidget(find_box)
+
+        marker_edit_box = QGroupBox("Properties")
+        m_form = self._form_layout(marker_edit_box)
+        self.marker_id_edit = QLineEdit("")
+        self.marker_id_edit.setReadOnly(True)
+        self.marker_id_edit.setToolTip("Editor-assigned identifier. Not editable.")
+        self.marker_side_edit = QLineEdit("")
+        self.marker_x_edit = QLineEdit("")
+        self.marker_y_edit = QLineEdit("")
+        self.marker_x_edit.setToolTip("Requires exactly one selected marker. Leave empty to keep X/Y.")
+        self.marker_y_edit.setToolTip("Requires exactly one selected marker. Leave empty to keep X/Y.")
+        m_form.addRow("Marker ID", self.marker_id_edit)
+        m_form.addRow("Side length", self.marker_side_edit)
+        m_form.addRow("X / Y", self._make_row(self.marker_x_edit, self.marker_y_edit))
+        self.marker_label_position_combo = self._make_label_position_combo()
+        m_form.addRow("Label position", self.marker_label_position_combo)
+        self.marker_label_orientation_combo = self._make_label_orientation_combo()
+        m_form.addRow("Label orientation", self.marker_label_orientation_combo)
+
+        self.b_apply_marker_edits = QPushButton("Confirm marker edits")
+        self.b_apply_marker_edits.setAutoDefault(False)
+        self.b_apply_marker_edits.clicked.connect(self._apply_pending_marker_edits)
+
+        scroll_inner = QWidget()
+        scroll_layout = QVBoxLayout(scroll_inner)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(8)
+        scroll_layout.addWidget(marker_edit_box)
+        scroll_layout.addStretch(1)
+        layout.addWidget(self._scroll_area(scroll_inner), stretch=1)
+        layout.addWidget(self.b_apply_marker_edits)
+
+        tools = QGroupBox("Actions")
+        tools_form = self._form_layout(tools)
+        self.b_add_marker = QPushButton("Add Orientation Marker")
+        self.b_add_marker.setCheckable(True)
+        self.b_add_marker.setAutoDefault(False)
+        self.b_add_marker.toggled.connect(self._set_add_marker_mode)
+        b_delete_marker = QPushButton("Delete selected")
+        b_delete_marker.setAutoDefault(False)
+        b_delete_marker.clicked.connect(self._delete_selected_markers)
+        tools_form.addRow(self.b_add_marker)
+        tools_form.addRow(b_delete_marker)
         layout.addWidget(tools)
         return tab
 
@@ -656,11 +751,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
             "Move: X/Y on one item, or dX/dY on the selection\n"
             "Add Electrode: click the scene\n"
             "Add Pad: choose an electrode, then click the scene\n"
+            "Add Orientation Marker: click the scene (no link required)\n"
             "Delete / Backspace: delete selected\n"
             "Ctrl+Z / Ctrl+Y: undo / redo\n"
             "Ctrl+0: fit both mapping views (electrodes and pads)\n"
             "Ctrl+T: electrode table\n"
-            "View > Map labels: choose IDs drawn on both maps",
+            "View > Map labels: choose IDs drawn on both maps\n"
+            "Label position: above / below / left / right of each item (native file only)\n"
+            "Label orientation: 0° / 90° / 180° / 270° clockwise (native file only)",
         )
 
     def _show_about(self) -> None:
@@ -672,7 +770,9 @@ class ElectrodeArrayEditorQt(QMainWindow):
             "<p>GUI and library to create and modify Multi-Electrode Arrays.</p>"
             f"<p>Native file format: mea_editor {NATIVE_VERSION}</p>"
             "<p>Keep native JSON as the source of truth. SpikeInterface and XLSX "
-            "are exports.</p>"
+            "are exports. Orientation markers are saved natively and in Excel / "
+            "analysis; they are omitted from SpikeInterface. Label position and "
+            "orientation are native JSON only.</p>"
             "<p>License: MIT<br>"
             "Wireless Neural Interface Team</p>",
         )
@@ -684,6 +784,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
     def _selected_pad_items(self) -> list[PadView]:
         """Return currently selected items, filtered to PadView."""
         return [it for it in self.scene.selectedItems() if isinstance(it, PadView)]
+
+    def _selected_marker_items(self) -> list[OrientationMarkerView]:
+        """Return currently selected items, filtered to OrientationMarkerView."""
+        return [it for it in self.scene.selectedItems() if isinstance(it, OrientationMarkerView)]
 
     def _on_scene_selection_changed(self) -> None:
         """Keep associated pads and electrodes selected together, then refresh the panel."""
@@ -742,10 +846,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Stop the other add-mode when switching parameterization tabs."""
         if not hasattr(self, "b_add_pad") or not hasattr(self, "b_add_electrode"):
             return
-        if index == TAB_ELECTRODES and self.b_add_pad.isChecked():
-            self.b_add_pad.setChecked(False)
-        elif index == TAB_PADS and self.b_add_electrode.isChecked():
+        if index != TAB_ELECTRODES and self.b_add_electrode.isChecked():
             self.b_add_electrode.setChecked(False)
+        if index != TAB_PADS and self.b_add_pad.isChecked():
+            self.b_add_pad.setChecked(False)
+        if hasattr(self, "b_add_marker") and index != TAB_MARKERS and self.b_add_marker.isChecked():
+            self.b_add_marker.setChecked(False)
 
     def _set_active_map_view(self, view: ElectrodeArrayView) -> None:
         """Remember which mapping viewport last received interaction."""
@@ -846,6 +952,39 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.point_tabs.setCurrentIndex(TAB_PADS)
         self._refresh_panel_values()
 
+    def _find_by_marker_id(self) -> None:
+        """Select the orientation marker whose ID matches the find field and scroll to it."""
+        query = self.marker_id_find_edit.text().strip()
+        if not query:
+            QMessageBox.information(self, "Find Marker ID", "Enter a Marker ID to search.")
+            return
+        if not self.marker_items:
+            QMessageBox.information(self, "Find Marker ID", "No orientation markers in the current array.")
+            return
+        try:
+            marker_id = int(query)
+        except ValueError:
+            QMessageBox.information(self, "Find Marker ID", "Marker ID must be an integer.")
+            return
+
+        item = self.marker_items.get(marker_id)
+        if item is None:
+            QMessageBox.information(
+                self,
+                "Marker ID not found",
+                f"No orientation marker has ID {marker_id}.",
+            )
+            return
+
+        self.scene.clearSelection()
+        item.setSelected(True)
+        pad = 40.0
+        united = item.sceneBoundingRect().adjusted(-pad, -pad, pad, pad)
+        self.electrode_view.ensureVisible(united, 80, 80)
+        self.pads_map_view.ensureVisible(united, 80, 80)
+        self.point_tabs.setCurrentIndex(TAB_MARKERS)
+        self._refresh_panel_values()
+
     def _electrode_attribute_texts(self, model: Electrode) -> list[str]:
         """String forms of every schema (and leftover extra) attribute on one electrode."""
         keys = [spec.key for spec in self.attribute_schema]
@@ -909,12 +1048,16 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def _grid_axes(self, view=None) -> tuple[list[float], list[float]]:
         """Return sorted unique X/Y coordinates for grid and axes of one mapping view."""
-        if view is self.pads_map_view and self.pads:
-            models = self.pads.values()
-        elif view is self.electrode_view and self.electrodes:
-            models = self.electrodes.values()
+        if view is self.pads_map_view and (self.pads or self.orientation_markers):
+            models = list(self.pads.values()) + list(self.orientation_markers.values())
+        elif view is self.electrode_view and (self.electrodes or self.orientation_markers):
+            models = list(self.electrodes.values()) + list(self.orientation_markers.values())
         else:
-            models = list(self.electrodes.values()) + list(self.pads.values())
+            models = (
+                list(self.electrodes.values())
+                + list(self.pads.values())
+                + list(self.orientation_markers.values())
+            )
         xs = {round(model.x, 6) for model in models}
         ys = {round(model.y, 6) for model in models}
         return sorted(xs), sorted(ys)
@@ -937,11 +1080,22 @@ class ElectrodeArrayEditorQt(QMainWindow):
         return rect
 
     def _array_bounds_rect(self, margin: float = 0.0) -> QRectF:
-        """Bounding rect of all electrodes and pads (center + half-extents)."""
-        return self._models_bounds_rect(
-            list(self.electrodes.values()) + list(self.pads.values()),
-            margin=margin,
-        )
+        """Bounding rect of all electrodes, pads, and orientation markers."""
+        parts: list[QRectF] = []
+        contacts = list(self.electrodes.values()) + list(self.pads.values())
+        if contacts:
+            parts.append(self._models_bounds_rect(contacts))
+        if self.orientation_markers:
+            parts.append(self._marker_bounds_rect())
+        if not parts:
+            rect = QRectF(-1.0, -1.0, 2.0, 2.0)
+        else:
+            rect = parts[0]
+            for part in parts[1:]:
+                rect = rect.united(part)
+        if margin > 0:
+            rect = rect.adjusted(-margin, -margin, margin, margin)
+        return rect
 
     def _electrode_bounds_rect(self, margin: float = 0.0) -> QRectF:
         """Bounding rect of electrodes only."""
@@ -951,11 +1105,31 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Bounding rect of pads only."""
         return self._models_bounds_rect(self.pads.values(), margin=margin)
 
+    def _marker_bounds_rect(self, margin: float = 0.0) -> QRectF:
+        """Bounding rect of orientation markers (center + half side)."""
+        extents: list[tuple[float, float, float, float]] = []
+        for marker in self.orientation_markers.values():
+            half = marker.half_side()
+            extents.append((marker.x, marker.y, half, half))
+        if not extents:
+            return QRectF(-1.0, -1.0, 2.0, 2.0)
+        min_x = min(x - half_x for x, y, half_x, half_y in extents)
+        max_x = max(x + half_x for x, y, half_x, half_y in extents)
+        min_y = min(y - half_y for x, y, half_x, half_y in extents)
+        max_y = max(y + half_y for x, y, half_x, half_y in extents)
+        rect = QRectF(min_x, min_y, max(max_x - min_x, 1.0), max(max_y - min_y, 1.0))
+        if margin > 0:
+            rect = rect.adjusted(-margin, -margin, margin, margin)
+        return rect
+
     def _capture_state(self) -> EditorState:
         """Capture full state snapshot for undo/redo."""
         return EditorState(
             electrodes={eid: m.snapshot() for eid, m in self.electrodes.items()},
             pads={pad_id: m.snapshot() for pad_id, m in self.pads.items()},
+            orientation_markers={
+                marker_id: m.snapshot() for marker_id, m in self.orientation_markers.items()
+            },
             attribute_schema=tuple(self.attribute_schema),
             map_labels=tuple(sorted(self.visible_map_label_keys)),
             si_units=self.si_units,
@@ -980,26 +1154,36 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self,
         models: list[Electrode],
         pads: list[Pad] | None = None,
+        orientation_markers: list[OrientationMarker] | None = None,
         *,
         keep_pads: bool = False,
+        keep_markers: bool = False,
     ) -> None:
         """
-        Replace entire scene content with the given electrode and pad lists.
+        Replace entire scene content with the given electrode, pad, and marker lists.
         """
         if pads is None:
             pads = list(self.pads.values()) if keep_pads else []
+        if orientation_markers is None:
+            orientation_markers = (
+                list(self.orientation_markers.values()) if keep_markers else []
+            )
         fill_electrodes_extras(models, self.attribute_schema, prune=False)
         eid_fixes, pad_id_fixes = ensure_unique_model_ids(models, pads)
-        if (eid_fixes or pad_id_fixes) and not self._is_restoring_state:
+        marker_id_fixes = ensure_unique_marker_ids(orientation_markers)
+        if (eid_fixes or pad_id_fixes or marker_id_fixes) and not self._is_restoring_state:
             parts: list[str] = []
             if eid_fixes:
                 parts.append(f"{eid_fixes} duplicate electrode ID(s) were reassigned.")
             if pad_id_fixes:
                 parts.append(f"{pad_id_fixes} duplicate pad ID(s) were reassigned.")
-            parts.append(
-                "Pads keep their stored electrode link: they stay on the electrode "
-                "that kept the original ID."
-            )
+            if marker_id_fixes:
+                parts.append(f"{marker_id_fixes} duplicate orientation-marker ID(s) were reassigned.")
+            if eid_fixes or pad_id_fixes:
+                parts.append(
+                    "Pads keep their stored electrode link: they stay on the electrode "
+                    "that kept the original ID."
+                )
             QMessageBox.warning(self, "Duplicate identifiers", "\n".join(parts))
         cameras = self._capture_map_cameras()
         visible = QRectF()
@@ -1016,10 +1200,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.items.clear()
             self.pads.clear()
             self.pad_items.clear()
+            self.orientation_markers.clear()
+            self.marker_items.clear()
             for model in models:
                 self._add_electrode_item(model)
             for pad in pads:
                 self._add_pad_item(pad)
+            for marker in orientation_markers:
+                self._add_marker_item(marker)
             self._ensure_scene_rect(extra=visible if not visible.isNull() else None)
             self._restore_map_cameras(cameras)
         finally:
@@ -1064,9 +1252,22 @@ class ElectrodeArrayEditorQt(QMainWindow):
         item._layout_labels()
         return item
 
+    def _add_marker_item(self, marker: OrientationMarker) -> OrientationMarkerView:
+        """Add one orientation marker without rebuilding existing items."""
+        item = OrientationMarkerView(
+            marker,
+            self._on_scene_visuals_changed,
+            self._refresh_panel_values,
+        )
+        self.scene.addItem(item)
+        self.orientation_markers[marker.marker_id] = marker
+        self.marker_items[marker.marker_id] = item
+        item._layout_labels()
+        return item
+
     def _set_electrodes(self, models: list[Electrode]) -> None:
-        """Replace scene electrodes while keeping current pads."""
-        self._set_array(models, keep_pads=True)
+        """Replace scene electrodes while keeping current pads and markers."""
+        self._set_array(models, keep_pads=True, keep_markers=True)
 
     def _next_unique_intan_id(self) -> str:
         """Return the first sequential INTAN ID not already used in the array."""
@@ -1229,6 +1430,78 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.pad_size_label.setText(primary_size_field_label(shape))
 
     @staticmethod
+    def _make_label_position_combo() -> QComboBox:
+        """Combo for the editor-only map-label side (native JSON, not exported)."""
+        combo = QComboBox()
+        for value in LABEL_POSITIONS:
+            combo.addItem(LABEL_POSITION_CAPTIONS[value], value)
+        combo.setToolTip(
+            "Where map text is drawn relative to this item. "
+            "Saved in native JSON only; omitted from SpikeInterface and XLSX exports."
+        )
+        return combo
+
+    @staticmethod
+    def _set_label_position_combo(combo: QComboBox, value: str, mixed: bool) -> None:
+        """Show a real side, or a mixed placeholder that Confirm will leave unchanged."""
+        combo.blockSignals(True)
+        if combo.findText(MIXED_SHAPE_LABEL) >= 0:
+            combo.removeItem(combo.findText(MIXED_SHAPE_LABEL))
+        if mixed:
+            combo.insertItem(0, MIXED_SHAPE_LABEL)
+            combo.setCurrentIndex(0)
+        else:
+            idx = combo.findData(normalize_label_position(value))
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    @staticmethod
+    def _label_position_from_combo(combo: QComboBox) -> str | None:
+        """Return the chosen side, or None when the selection is mixed / empty."""
+        if combo.currentText() == MIXED_SHAPE_LABEL:
+            return None
+        data = combo.currentData()
+        if data is None:
+            return None
+        return normalize_label_position(data)
+
+    @staticmethod
+    def _make_label_orientation_combo() -> QComboBox:
+        """Combo for the editor-only map-label rotation (native JSON, not exported)."""
+        combo = QComboBox()
+        for value in LABEL_ORIENTATIONS:
+            combo.addItem(LABEL_ORIENTATION_CAPTIONS[value], value)
+        combo.setToolTip(
+            "Clockwise rotation of the outside map text. "
+            "Saved in native JSON only; omitted from SpikeInterface and XLSX exports."
+        )
+        return combo
+
+    @staticmethod
+    def _set_label_orientation_combo(combo: QComboBox, value: int, mixed: bool) -> None:
+        """Show a real rotation, or a mixed placeholder that Confirm will leave unchanged."""
+        combo.blockSignals(True)
+        if combo.findText(MIXED_SHAPE_LABEL) >= 0:
+            combo.removeItem(combo.findText(MIXED_SHAPE_LABEL))
+        if mixed:
+            combo.insertItem(0, MIXED_SHAPE_LABEL)
+            combo.setCurrentIndex(0)
+        else:
+            idx = combo.findData(normalize_label_orientation(value))
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+    @staticmethod
+    def _label_orientation_from_combo(combo: QComboBox) -> int | None:
+        """Return the chosen rotation, or None when the selection is mixed / empty."""
+        if combo.currentText() == MIXED_SHAPE_LABEL:
+            return None
+        data = combo.currentData()
+        if data is None:
+            return None
+        return normalize_label_orientation(data)
+
+    @staticmethod
     def _set_shape_combo(combo: QComboBox, shapes: tuple[str, ...], value: str, mixed: bool) -> None:
         """Show a real shape, or a mixed placeholder that Confirm will leave unchanged."""
         combo.blockSignals(True)
@@ -1257,6 +1530,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
         if enabled:
             if self.b_add_pad.isChecked():
                 self.b_add_pad.setChecked(False)
+            if self.b_add_marker.isChecked():
+                self.b_add_marker.setChecked(False)
             self.b_add_electrode.setText("Stop Adding")
             self._sync_add_cursors()
         else:
@@ -1291,6 +1566,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 return
             if self.b_add_electrode.isChecked():
                 self.b_add_electrode.setChecked(False)
+            if self.b_add_marker.isChecked():
+                self.b_add_marker.setChecked(False)
             self.is_add_pad_mode = True
             self.b_add_pad.setText("Stop Adding")
             self._sync_add_cursors()
@@ -1299,9 +1576,24 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.b_add_pad.setText("Add Pad")
             self._sync_add_cursors()
 
+    def _set_add_marker_mode(self, enabled: bool) -> None:
+        """Toggle one-click orientation-marker creation mode."""
+        if enabled:
+            if self.b_add_electrode.isChecked():
+                self.b_add_electrode.setChecked(False)
+            if self.b_add_pad.isChecked():
+                self.b_add_pad.setChecked(False)
+            self.is_add_marker_mode = True
+            self.b_add_marker.setText("Stop Adding")
+            self._sync_add_cursors()
+        else:
+            self.is_add_marker_mode = False
+            self.b_add_marker.setText("Add Orientation Marker")
+            self._sync_add_cursors()
+
     def _sync_add_cursors(self) -> None:
         """Show a crosshair on both mapping views while add-mode is active."""
-        adding = self.is_add_mode or self.is_add_pad_mode
+        adding = self.is_add_mode or self.is_add_pad_mode or self.is_add_marker_mode
         for view in (self.electrode_view, self.pads_map_view):
             if adding:
                 view.viewport().setCursor(Qt.CrossCursor)
@@ -1309,9 +1601,11 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 view.viewport().unsetCursor()
 
     def _add_point_at(self, x: float, y: float) -> None:
-        """Dispatch scene click to electrode or pad creation."""
+        """Dispatch scene click to electrode, pad, or orientation-marker creation."""
         if self.is_add_pad_mode:
             self._add_pad_at(x, y)
+        elif self.is_add_marker_mode:
+            self._add_marker_at(x, y)
         else:
             self._add_electrode_at(x, y)
 
@@ -1320,12 +1614,18 @@ class ElectrodeArrayEditorQt(QMainWindow):
         before = self._capture_state()
         next_eid = max(self.electrodes.keys(), default=-1) + 1
         next_pad_id = max(self.pads.keys(), default=-1) + 1
+        orientation = self._label_orientation_from_combo(self.label_orientation_combo)
         model = Electrode(
             eid=next_eid,
             x=x,
             y=y,
             potentiostat_id=self._next_unique_potentiostat_id(),
             intan_id=self._next_unique_intan_id(),
+            label_position=self._label_position_from_combo(self.label_position_combo)
+            or DEFAULT_LABEL_POSITION,
+            label_orientation=(
+                DEFAULT_LABEL_ORIENTATION if orientation is None else orientation
+            ),
         )
         fill_electrode_extras(model, self.attribute_schema)
         offset = max(model.radius, DEFAULT_PAD_RADIUS) * 3.0 + 20.0
@@ -1367,7 +1667,18 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return
         before = self._capture_state()
         next_pad_id = max(self.pads.keys(), default=-1) + 1
-        pad = Pad(pad_id=next_pad_id, electrode_eid=target_eid, x=x, y=y)
+        orientation = self._label_orientation_from_combo(self.pad_label_orientation_combo)
+        pad = Pad(
+            pad_id=next_pad_id,
+            electrode_eid=target_eid,
+            x=x,
+            y=y,
+            label_position=self._label_position_from_combo(self.pad_label_position_combo)
+            or DEFAULT_LABEL_POSITION,
+            label_orientation=(
+                DEFAULT_LABEL_ORIENTATION if orientation is None else orientation
+            ),
+        )
         self._is_mutating_scene = True
         try:
             item = self._add_pad_item(pad)
@@ -1380,6 +1691,44 @@ class ElectrodeArrayEditorQt(QMainWindow):
         item.setSelected(True)
         if self._new_pad_electrode_eid() is None and self.is_add_pad_mode:
             self.b_add_pad.setChecked(False)
+        self._on_scene_visuals_changed()
+        self._commit_if_changed(before)
+
+    def _add_marker_at(self, x: float, y: float) -> None:
+        """Create a new orientation marker at (x, y) and select it."""
+        before = self._capture_state()
+        next_id = max(self.orientation_markers.keys(), default=-1) + 1
+        side = DEFAULT_MARKER_SIDE
+        side_text = self.marker_side_edit.text().strip()
+        if side_text:
+            try:
+                parsed = float(side_text)
+                if parsed > 0:
+                    side = parsed
+            except ValueError:
+                pass
+        orientation = self._label_orientation_from_combo(self.marker_label_orientation_combo)
+        marker = OrientationMarker(
+            marker_id=next_id,
+            x=x,
+            y=y,
+            side=side,
+            label_position=self._label_position_from_combo(self.marker_label_position_combo)
+            or DEFAULT_LABEL_POSITION,
+            label_orientation=(
+                DEFAULT_LABEL_ORIENTATION if orientation is None else orientation
+            ),
+        )
+        self._is_mutating_scene = True
+        try:
+            item = self._add_marker_item(marker)
+        finally:
+            self._is_mutating_scene = False
+        self.scene.clearSelection()
+        item.setSelected(True)
+        self.point_tabs.blockSignals(True)
+        self.point_tabs.setCurrentIndex(TAB_MARKERS)
+        self.point_tabs.blockSignals(False)
         self._on_scene_visuals_changed()
         self._commit_if_changed(before)
 
@@ -1611,7 +1960,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         QMessageBox.information(
             self,
             "Export XLSX",
-            "Workbook exported successfully (electrodes, pads, and attribute schema).",
+            "Workbook exported successfully (electrodes, pads, orientation markers, and attribute schema).",
         )
 
     def _confirm_pairing(self, title: str, question: str) -> bool:
@@ -1749,6 +2098,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
             pads=list(self.pads.values()),
             electrode_attributes=self.attribute_schema,
             map_labels=self.visible_map_label_keys,
+            orientation_markers=list(self.orientation_markers.values()),
         )
 
     def _load_array_from_file(self, path: str) -> None:
@@ -1757,7 +2107,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.si_units = document.si_units
         self.visible_map_label_keys = set(document.map_labels)
         self._set_attribute_schema(document.electrode_attributes, prune=False)
-        self._set_array(document.electrodes, document.pads)
+        self._set_array(document.electrodes, document.pads, document.orientation_markers)
 
     def _export_analysis_to_xlsx(self, path: str) -> None:
         """
@@ -1768,16 +2118,18 @@ class ElectrodeArrayEditorQt(QMainWindow):
             list(self.electrodes.values()),
             pads=list(self.pads.values()),
             electrode_attributes=self.attribute_schema,
+            orientation_markers=list(self.orientation_markers.values()),
         )
 
     def _export_matrix_to_xlsx(self, path: str) -> None:
-        """Export electrodes, pads, and the attribute schema into an XLSX workbook."""
+        """Export electrodes, pads, orientation markers, and the attribute schema into an XLSX workbook."""
         export_array_xlsx(
             path,
             list(self.electrodes.values()),
             pads=list(self.pads.values()),
             electrode_attributes=self.attribute_schema,
             si_units=self.si_units,
+            orientation_markers=list(self.orientation_markers.values()),
         )
 
     def _update_duplicate_flags(self) -> None:
@@ -1800,6 +2152,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return False
         if a.electrodes.keys() != b.electrodes.keys() or a.pads.keys() != b.pads.keys():
             return False
+        if a.orientation_markers.keys() != b.orientation_markers.keys():
+            return False
         tol = 1e-9
         for eid in a.electrodes:
             left = a.electrodes[eid]
@@ -1810,6 +2164,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 or left.manufacturer_id != right.manufacturer_id
                 or left.shank_id != right.shank_id
                 or left.shape != right.shape
+                or left.label_position != right.label_position
+                or left.label_orientation != right.label_orientation
                 or left.extra != right.extra
             ):
                 return False
@@ -1824,9 +2180,24 @@ class ElectrodeArrayEditorQt(QMainWindow):
             right = b.pads[pad_id]
             if left.electrode_eid != right.electrode_eid or left.shape != right.shape:
                 return False
+            if left.label_position != right.label_position:
+                return False
+            if left.label_orientation != right.label_orientation:
+                return False
             if abs(left.x - right.x) > tol or abs(left.y - right.y) > tol or abs(left.radius - right.radius) > tol:
                 return False
             if abs(left.height - right.height) > tol:
+                return False
+        for marker_id in a.orientation_markers:
+            left = a.orientation_markers[marker_id]
+            right = b.orientation_markers[marker_id]
+            if abs(left.x - right.x) > tol or abs(left.y - right.y) > tol:
+                return False
+            if abs(left.side - right.side) > tol:
+                return False
+            if left.label_position != right.label_position:
+                return False
+            if left.label_orientation != right.label_orientation:
                 return False
         return True
 
@@ -1846,7 +2217,11 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 Pad.from_snapshot(pad_id, snap)
                 for pad_id, snap in sorted(state.pads.items(), key=lambda kv: kv[0])
             ]
-            self._set_array(models, pads)
+            markers = [
+                OrientationMarker.from_snapshot(marker_id, snap)
+                for marker_id, snap in sorted(state.orientation_markers.items(), key=lambda kv: kv[0])
+            ]
+            self._set_array(models, pads, markers)
         finally:
             self._is_restoring_state = False
         self._on_scene_visuals_changed()
@@ -1967,18 +2342,25 @@ class ElectrodeArrayEditorQt(QMainWindow):
             item._layout_labels(view_attr)
         for item in self.pad_items.values():
             item._layout_labels(view_attr)
+        for item in self.marker_items.values():
+            item._layout_labels(view_attr)
 
     def _fit_target_rect(self, index: int) -> QRectF:
         """Bounds used to frame a mapping view (electrodes left, pads right)."""
         if index == TAB_PADS:
             if self.pads:
-                return self._pad_bounds_rect()
-            if self.electrodes:
-                return self._electrode_bounds_rect()
-            return self._array_bounds_rect()
-        if self.electrodes:
-            return self._electrode_bounds_rect()
-        return self._array_bounds_rect()
+                base = self._pad_bounds_rect()
+            elif self.electrodes:
+                base = self._electrode_bounds_rect()
+            else:
+                base = self._array_bounds_rect()
+        elif self.electrodes:
+            base = self._electrode_bounds_rect()
+        else:
+            base = self._array_bounds_rect()
+        if self.orientation_markers:
+            base = base.united(self._marker_bounds_rect())
+        return base
 
     def _map_views(self) -> tuple[ElectrodeArrayView, ElectrodeArrayView]:
         """Left (electrodes) and right (pads) mapping cameras."""
@@ -2034,7 +2416,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def _fit_all_views(self) -> None:
         """Fit each mapping viewport to its target now that both are visible."""
-        if not self.electrodes and not self.pads:
+        if not self.electrodes and not self.pads and not self.orientation_markers:
             return
         self._fit_graphics_view(self.electrode_view, self._fit_target_rect(TAB_ELECTRODES))
         self._fit_graphics_view(self.pads_map_view, self._fit_target_rect(TAB_PADS))
@@ -2299,6 +2681,9 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 QMessageBox.critical(self, "Invalid contact plane axis", "Use 4 values: x0, x1, y0, y1.")
                 return
 
+        label_position = self._label_position_from_combo(self.label_position_combo)
+        label_orientation = self._label_orientation_from_combo(self.label_orientation_combo)
+
         for item in selected:
             item_shape = (
                 shape_value
@@ -2311,6 +2696,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 item.set_radius(stored_half_from_size_field(item_shape, radius_field))
             if plane_value is not None:
                 item.model.contact_plane_axis = plane_value
+            if label_position is not None:
+                item.model.label_position = label_position
+            if label_orientation is not None:
+                item.model.label_orientation = label_orientation
             for key, value in parsed_attributes.items():
                 item.model.set_attribute(key, value)
             if shape_uses_height(item_shape):
@@ -2332,7 +2721,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._commit_if_changed(before)
 
     def _move_selection_by_delta(self) -> None:
-        """Move selected electrodes and pads by (dX, dY)."""
+        """Move selected electrodes, pads, and orientation markers by (dX, dY)."""
         electrodes = [
             item
             for item in self._selected_electrode_items()
@@ -2343,7 +2732,8 @@ class ElectrodeArrayEditorQt(QMainWindow):
             for item in self._selected_pad_items()
             if item.model.pad_id not in self._auto_selected_pad_ids
         ]
-        if not electrodes and not pads:
+        markers = self._selected_marker_items()
+        if not electrodes and not pads and not markers:
             return
         before = self._capture_state()
         try:
@@ -2352,7 +2742,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         except ValueError:
             QMessageBox.critical(self, "Invalid dX/dY", "dX and dY must be numeric values.")
             return
-        for item in electrodes + pads:
+        for item in electrodes + pads + markers:
             p = item.pos()
             item.setPos(p.x() + dx, p.y() + dy)
         self._refresh_panel_values()
@@ -2368,7 +2758,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         selected_eids = {item.model.eid for item in selected}
         models = [m for m in self.electrodes.values() if m.eid not in selected_eids]
         pads = [p for p in self.pads.values() if p.electrode_eid not in selected_eids]
-        self._set_array(models, pads)
+        self._set_array(models, pads, keep_markers=True)
         self._commit_if_changed(before)
 
     def _delete_selected_pads(self) -> None:
@@ -2379,14 +2769,29 @@ class ElectrodeArrayEditorQt(QMainWindow):
         before = self._capture_state()
         selected_pad_ids = {item.model.pad_id for item in selected}
         pads = [p for p in self.pads.values() if p.pad_id not in selected_pad_ids]
-        self._set_array(list(self.electrodes.values()), pads)
+        self._set_array(list(self.electrodes.values()), pads, keep_markers=True)
+        self._commit_if_changed(before)
+
+    def _delete_selected_markers(self) -> None:
+        """Delete selected orientation markers only."""
+        selected = self._selected_marker_items()
+        if not selected:
+            return
+        before = self._capture_state()
+        selected_ids = {item.model.marker_id for item in selected}
+        markers = [m for m in self.orientation_markers.values() if m.marker_id not in selected_ids]
+        self._set_array(
+            list(self.electrodes.values()),
+            list(self.pads.values()),
+            markers,
+        )
         self._commit_if_changed(before)
 
     def _delete_selected(self) -> None:
-        """Delete selected electrodes (and their pads) and selected pads.
+        """Delete selected electrodes (and their pads), selected pads, and markers.
 
         Items selected only because their associated counterpart is selected
-        are not deleted on their own.
+        are not deleted on their own. Orientation markers are never auto-selected.
         """
         electrodes = [
             item
@@ -2398,18 +2803,23 @@ class ElectrodeArrayEditorQt(QMainWindow):
             for item in self._selected_pad_items()
             if item.model.pad_id not in self._auto_selected_pad_ids
         ]
-        if not electrodes and not pads:
+        markers = self._selected_marker_items()
+        if not electrodes and not pads and not markers:
             return
         before = self._capture_state()
         selected_eids = {item.model.eid for item in electrodes}
         selected_pad_ids = {item.model.pad_id for item in pads}
+        selected_marker_ids = {item.model.marker_id for item in markers}
         models = [m for m in self.electrodes.values() if m.eid not in selected_eids]
         remaining_pads = [
             p
             for p in self.pads.values()
             if p.pad_id not in selected_pad_ids and p.electrode_eid not in selected_eids
         ]
-        self._set_array(models, remaining_pads)
+        remaining_markers = [
+            m for m in self.orientation_markers.values() if m.marker_id not in selected_marker_ids
+        ]
+        self._set_array(models, remaining_pads, remaining_markers)
         self._commit_if_changed(before)
 
     def _apply_pending_pad_edits(self) -> None:
@@ -2500,6 +2910,9 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
                 return
 
+        label_position = self._label_position_from_combo(self.pad_label_position_combo)
+        label_orientation = self._label_orientation_from_combo(self.pad_label_orientation_combo)
+
         for item in selected:
             item_shape = (
                 shape_value
@@ -2512,6 +2925,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 item.model.shape = item_shape
             if radius_field is not None:
                 item.set_radius(stored_half_from_size_field(item_shape, radius_field))
+            if label_position is not None:
+                item.model.label_position = label_position
+            if label_orientation is not None:
+                item.model.label_orientation = label_orientation
             if shape_uses_height(item_shape):
                 if height_field is not None:
                     item.set_height(stored_half_from_size_field("rect", height_field))
@@ -2529,16 +2946,82 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self._sync_electrode_table(reload_data=True)
         self._commit_if_changed(before)
 
+    def _apply_pending_marker_edits(self) -> None:
+        """
+        Apply all non-empty orientation-marker fields in one confirmation action.
+
+        Empty text fields are treated as "no change". For X/Y, both values must
+        be provided together and require exactly one selected marker.
+        """
+        selected = self._selected_marker_items()
+        if not selected:
+            return
+
+        side_text = self.marker_side_edit.text().strip()
+        x_text = self.marker_x_edit.text().strip()
+        y_text = self.marker_y_edit.text().strip()
+
+        if (x_text and not y_text) or (y_text and not x_text):
+            QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
+            return
+        if (x_text or y_text) and len(selected) != 1:
+            QMessageBox.information(self, "Single selection required", "X/Y edition requires exactly one marker.")
+            return
+
+        before = self._capture_state()
+
+        side_field: float | None = None
+        if side_text:
+            try:
+                side_field = float(side_text)
+                if side_field <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.critical(self, "Invalid side length", "Side length must be a positive number.")
+                return
+
+        x_value: float | None = None
+        y_value: float | None = None
+        if x_text and y_text:
+            try:
+                x_value = float(x_text)
+                y_value = float(y_text)
+            except ValueError:
+                QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
+                return
+
+        label_position = self._label_position_from_combo(self.marker_label_position_combo)
+        label_orientation = self._label_orientation_from_combo(self.marker_label_orientation_combo)
+
+        for item in selected:
+            if side_field is not None:
+                item.set_side(side_field)
+            if label_position is not None:
+                item.model.label_position = label_position
+            if label_orientation is not None:
+                item.model.label_orientation = label_orientation
+            item.sync_from_model()
+
+        if x_value is not None and y_value is not None:
+            selected[0].setPos(x_value, y_value)
+
+        self._ensure_scene_rect()
+        self._refresh_panel_values()
+        self._commit_if_changed(before)
+
     def _refresh_panel_values(self) -> None:
         """
         Update side panel fields according to selection.
 
-        Electrode tab and pad tab are filled independently from their selections.
+        Electrode, pad, and orientation-marker tabs are filled independently.
         A homogeneous selection switches to the matching parameterization tab.
         """
         electrodes = self._selected_electrode_items()
         pads = self._selected_pad_items()
-        self.selected_count_label.setText(f"{len(electrodes)} electrode(s), {len(pads)} pad(s)")
+        markers = self._selected_marker_items()
+        self.selected_count_label.setText(
+            f"{len(electrodes)} electrode(s), {len(pads)} pad(s), {len(markers)} marker(s)"
+        )
 
         user_pads = [it for it in pads if it.model.pad_id not in self._auto_selected_pad_ids]
         user_electrodes = [
@@ -2548,6 +3031,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
             not self._is_restoring_state
             and not self.is_add_pad_mode
             and not self.is_add_mode
+            and not self.is_add_marker_mode
         ):
             if user_pads and self.point_tabs.currentIndex() != TAB_PADS:
                 self.point_tabs.blockSignals(True)
@@ -2557,9 +3041,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self.point_tabs.blockSignals(True)
                 self.point_tabs.setCurrentIndex(TAB_ELECTRODES)
                 self.point_tabs.blockSignals(False)
+            elif markers and not user_pads and not user_electrodes and self.point_tabs.currentIndex() != TAB_MARKERS:
+                self.point_tabs.blockSignals(True)
+                self.point_tabs.setCurrentIndex(TAB_MARKERS)
+                self.point_tabs.blockSignals(False)
 
         self._fill_electrode_panel(electrodes)
         self._fill_pad_panel(pads)
+        self._fill_marker_panel(markers)
         self._sync_electrode_table(reload_data=False)
 
     def _fill_attribute_edits(self, models: list[Electrode]) -> None:
@@ -2603,6 +3092,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.y_edit.setText(f"{m.y:.2f}")
             x0, x1, y0, y1 = m.contact_plane_axis
             self.contact_plane_axis_edit.setText(f"{x0:g}, {x1:g}, {y0:g}, {y1:g}")
+            self._set_label_position_combo(self.label_position_combo, m.label_position, mixed=False)
+            self._set_label_orientation_combo(
+                self.label_orientation_combo, m.label_orientation, mixed=False
+            )
             self._fill_attribute_edits([m])
             return
 
@@ -2643,6 +3136,14 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 self.contact_plane_axis_edit.setText("")
             self.x_edit.setText("")
             self.y_edit.setText("")
+            positions = [normalize_label_position(it.model.label_position) for it in selected]
+            mixed_position = not all(p == positions[0] for p in positions)
+            self._set_label_position_combo(self.label_position_combo, positions[0], mixed=mixed_position)
+            orientations = [normalize_label_orientation(it.model.label_orientation) for it in selected]
+            mixed_orientation = not all(o == orientations[0] for o in orientations)
+            self._set_label_orientation_combo(
+                self.label_orientation_combo, orientations[0], mixed=mixed_orientation
+            )
             self._fill_attribute_edits([it.model for it in selected])
             return
 
@@ -2653,6 +3154,10 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.contact_plane_axis_edit.setText("")
         self._set_shape_combo(self.shape_combo, ELECTRODE_SHAPES, DEFAULT_SHAPE, mixed=False)
         self._set_electrode_size_label(DEFAULT_SHAPE)
+        self._set_label_position_combo(self.label_position_combo, DEFAULT_LABEL_POSITION, mixed=False)
+        self._set_label_orientation_combo(
+            self.label_orientation_combo, DEFAULT_LABEL_ORIENTATION, mixed=False
+        )
         self._set_height_row_visible(
             self._electrode_geom_form,
             self.electrode_height_label,
@@ -2680,6 +3185,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.pad_x_edit.setText(f"{m.x:.2f}")
             self.pad_y_edit.setText(f"{m.y:.2f}")
             self.pad_id_edit.setText(str(m.pad_id))
+            self._set_label_position_combo(
+                self.pad_label_position_combo, m.label_position, mixed=False
+            )
+            self._set_label_orientation_combo(
+                self.pad_label_orientation_combo, m.label_orientation, mixed=False
+            )
             self._refresh_pad_electrode_combo(
                 selected_eid=m.electrode_eid,
                 mixed=False,
@@ -2724,6 +3235,16 @@ class ElectrodeArrayEditorQt(QMainWindow):
             )
             self.pad_x_edit.setText("")
             self.pad_y_edit.setText("")
+            positions = [normalize_label_position(it.model.label_position) for it in selected]
+            mixed_position = not all(p == positions[0] for p in positions)
+            self._set_label_position_combo(
+                self.pad_label_position_combo, positions[0], mixed=mixed_position
+            )
+            orientations = [normalize_label_orientation(it.model.label_orientation) for it in selected]
+            mixed_orientation = not all(o == orientations[0] for o in orientations)
+            self._set_label_orientation_combo(
+                self.pad_label_orientation_combo, orientations[0], mixed=mixed_orientation
+            )
             self._refresh_pad_electrode_combo(
                 selected_eid=None if mixed_eid else eids[0],
                 mixed=mixed_eid,
@@ -2738,6 +3259,12 @@ class ElectrodeArrayEditorQt(QMainWindow):
         self.pad_id_edit.setText("")
         self._set_shape_combo(self.pad_shape_combo, PAD_SHAPES, DEFAULT_PAD_SHAPE, mixed=False)
         self._set_pad_size_label(DEFAULT_PAD_SHAPE)
+        self._set_label_position_combo(
+            self.pad_label_position_combo, DEFAULT_LABEL_POSITION, mixed=False
+        )
+        self._set_label_orientation_combo(
+            self.pad_label_orientation_combo, DEFAULT_LABEL_ORIENTATION, mixed=False
+        )
         self._set_height_row_visible(
             self._pad_form,
             self.pad_height_label,
@@ -2745,6 +3272,56 @@ class ElectrodeArrayEditorQt(QMainWindow):
             False,
         )
         self._refresh_pad_electrode_combo()
+
+    def _fill_marker_panel(self, selected: list[OrientationMarkerView]) -> None:
+        """Fill orientation-marker parameterization fields from the current selection."""
+        if len(selected) == 1:
+            m = selected[0].model
+            self.marker_id_edit.setText(str(m.marker_id))
+            self.marker_side_edit.setText(f"{m.side:.2f}")
+            self.marker_x_edit.setText(f"{m.x:.2f}")
+            self.marker_y_edit.setText(f"{m.y:.2f}")
+            self._set_label_position_combo(
+                self.marker_label_position_combo, m.label_position, mixed=False
+            )
+            self._set_label_orientation_combo(
+                self.marker_label_orientation_combo, m.label_orientation, mixed=False
+            )
+            return
+
+        if len(selected) > 1:
+            sides = [it.model.side for it in selected]
+            marker_ids = [it.model.marker_id for it in selected]
+            self.marker_id_edit.setText(
+                str(marker_ids[0]) if all(value == marker_ids[0] for value in marker_ids) else ""
+            )
+            self.marker_side_edit.setText(
+                f"{sides[0]:.2f}" if max(sides) - min(sides) < 1e-9 else ""
+            )
+            self.marker_x_edit.setText("")
+            self.marker_y_edit.setText("")
+            positions = [normalize_label_position(it.model.label_position) for it in selected]
+            mixed_position = not all(p == positions[0] for p in positions)
+            self._set_label_position_combo(
+                self.marker_label_position_combo, positions[0], mixed=mixed_position
+            )
+            orientations = [normalize_label_orientation(it.model.label_orientation) for it in selected]
+            mixed_orientation = not all(o == orientations[0] for o in orientations)
+            self._set_label_orientation_combo(
+                self.marker_label_orientation_combo, orientations[0], mixed=mixed_orientation
+            )
+            return
+
+        self.marker_id_edit.setText("")
+        self.marker_side_edit.setText("")
+        self.marker_x_edit.setText("")
+        self.marker_y_edit.setText("")
+        self._set_label_position_combo(
+            self.marker_label_position_combo, DEFAULT_LABEL_POSITION, mixed=False
+        )
+        self._set_label_orientation_combo(
+            self.marker_label_orientation_combo, DEFAULT_LABEL_ORIENTATION, mixed=False
+        )
 
 
 def run_app() -> None:

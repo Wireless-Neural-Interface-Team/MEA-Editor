@@ -25,6 +25,13 @@ except ImportError as exc:
     raise SystemExit("PySide6 is required. Install with: pip install PySide6") from exc
 
 from .contact_shape import contact_half_extents
+from .electrode import (
+    DEFAULT_LABEL_ORIENTATION,
+    DEFAULT_LABEL_POSITION,
+    map_label_item_pos,
+    normalize_label_orientation,
+    normalize_label_position,
+)
 
 # Overlay axis band dimensions (in viewport pixels).
 AXIS_BAND_HEIGHT = 24
@@ -97,7 +104,7 @@ def _make_scoped_label(parent, view_attr: str, font: QFont, color: str) -> ViewS
 
 
 class ViewLabelPair:
-    """Center + below labels laid out for one mapping camera."""
+    """Center + outside labels laid out for one mapping camera."""
 
     def __init__(self, parent, view_attr: str, font: QFont) -> None:
         self.view_attr = view_attr
@@ -114,15 +121,26 @@ class ViewLabelPair:
         self.center.setBrush(center)
         self.below.setBrush(below)
 
-    def layout(self, scale: float, half_y: float) -> None:
+    def layout(
+        self,
+        scale: float,
+        half_x: float,
+        half_y: float,
+        position: str,
+        orientation: int = DEFAULT_LABEL_ORIENTATION,
+    ) -> None:
         br = self.center.boundingRect()
         label_w, label_h = br.width() / scale, br.height() / scale
+        self.center.setRotation(0)
         self.center.setPos(-label_w / 2, label_h / 2)
         cbr = self.below.boundingRect()
-        contact_h = cbr.height() / scale
-        y_offset = half_y + contact_h + 4.0
-        contact_w = cbr.width() / scale
-        self.below.setPos(-contact_w / 2, y_offset)
+        text_w, text_h = cbr.width() / scale, cbr.height() / scale
+        degrees = normalize_label_orientation(orientation)
+        self.below.setRotation(degrees)
+        x, y = map_label_item_pos(
+            position, half_x, half_y, text_w, text_h, orientation=degrees
+        )
+        self.below.setPos(x, y)
 
 
 class PerViewContactLabels:
@@ -157,14 +175,23 @@ class PerViewContactLabels:
         scale = abs(t.m11()) if t.m11() != 0 else 1.0
         return max(scale, 1e-6)
 
+    def _label_half_extents(self) -> tuple[float, float]:
+        return contact_half_extents(self.model.shape, self.model.radius, self.model.height)
+
     def _layout_labels(self, view_attr: str | None = None) -> None:
-        _half_x, half_y = contact_half_extents(
-            self.model.shape, self.model.radius, self.model.height
+        half_x, half_y = self._label_half_extents()
+        position = normalize_label_position(
+            getattr(self.model, "label_position", DEFAULT_LABEL_POSITION)
+        )
+        orientation = normalize_label_orientation(
+            getattr(self.model, "label_orientation", DEFAULT_LABEL_ORIENTATION)
         )
         for pair in self._view_labels:
             if view_attr is not None and pair.view_attr != view_attr:
                 continue
-            pair.layout(self._view_scale(pair.view_attr), half_y)
+            pair.layout(
+                self._view_scale(pair.view_attr), half_x, half_y, position, orientation
+            )
 
     def paint(self, painter, option, widget=None) -> None:  # type: ignore[override]
         super().paint(painter, _option_without_qt_selection(option), widget)
@@ -323,7 +350,7 @@ class ElectrodeArrayView(QGraphicsView):
 
         # Left button only.
         if event.button() == Qt.LeftButton:
-            # In add mode, left-click creates an electrode or pad at cursor position.
+            # In add mode, left-click creates an electrode, pad, or orientation marker.
             if self._is_add_mode():
                 scene_pos = self.mapToScene(event.pos())
                 self._add_at(scene_pos.x(), scene_pos.y())

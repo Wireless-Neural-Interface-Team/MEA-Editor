@@ -21,6 +21,7 @@ from .contact_shape import (
     size_field_from_stored_half,
     stored_half_from_size_field,
 )
+from .electrode import DEFAULT_LABEL_ORIENTATION, DEFAULT_LABEL_POSITION
 
 
 DEFAULT_PAD_RADIUS = 10.0
@@ -41,6 +42,8 @@ class PadSnapshot:
     radius: float
     height: float
     shape: str
+    label_position: str
+    label_orientation: int
 
 
 @dataclass(slots=True)
@@ -52,6 +55,8 @@ class Pad:
     - identity: pad_id (editor-assigned, like electrode eid)
     - association: electrode_eid (required link to an electrode)
     - geometry: x, y, radius, height
+    - editor display: label_position (above / below / left / right) and
+      label_orientation (0 / 90 / 180 / 270 degrees)
     - editor state: pairing flags
 
     Notes:
@@ -59,6 +64,8 @@ class Pad:
     - radius is the stored half-extent along X (true radius for a circle).
     - height is the stored half-extent along Y for rect; 0 means use radius.
     - Pairing flags are computed by the editor and drive display color.
+    - label_position and label_orientation are editor display only (native
+      JSON); they are omitted from SpikeInterface and XLSX exports.
     """
 
     pad_id: int
@@ -68,6 +75,8 @@ class Pad:
     radius: float = DEFAULT_PAD_RADIUS
     height: float = 0.0
     shape: str = DEFAULT_PAD_SHAPE
+    label_position: str = DEFAULT_LABEL_POSITION
+    label_orientation: int = DEFAULT_LABEL_ORIENTATION
     has_shared_electrode: bool = False
     has_missing_electrode: bool = False
 
@@ -80,6 +89,8 @@ class Pad:
             radius=self.radius,
             height=self.height,
             shape=self.shape,
+            label_position=self.label_position,
+            label_orientation=self.label_orientation,
         )
 
     def restore(self, snap: PadSnapshot) -> None:
@@ -90,6 +101,8 @@ class Pad:
         self.radius = snap.radius
         self.height = snap.height
         self.shape = snap.shape
+        self.label_position = snap.label_position
+        self.label_orientation = snap.label_orientation
 
     @classmethod
     def from_snapshot(cls, pad_id: int, snap: PadSnapshot) -> Pad:
@@ -102,6 +115,8 @@ class Pad:
             radius=snap.radius,
             height=snap.height,
             shape=snap.shape,
+            label_position=snap.label_position,
+            label_orientation=snap.label_orientation,
         )
 
     def has_any_duplicate(self) -> bool:

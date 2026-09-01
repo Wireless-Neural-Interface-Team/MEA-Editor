@@ -3,7 +3,8 @@ Interactive graphics item bound to one Pad model.
 
 It owns:
 - contact shape path (circle, square, or rect),
-- center / below labels from the associated electrode's visible IDs,
+- center label from the associated electrode's visible IDs,
+- outside labels placed above, below, left, or right of the pad,
 - fill color that varies by the linked electrode's shank (purples),
 - dashed link line toward the associated electrode.
 

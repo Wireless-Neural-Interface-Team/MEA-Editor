@@ -5,12 +5,14 @@ from __future__ import annotations
 import unittest
 
 from mea_editor.array_integrity import (
+    ensure_unique_marker_ids,
     ensure_unique_model_ids,
     pairing_problems,
     refresh_status_flags,
 )
 from mea_editor.attribute_schema import AttributeSpec, default_schema
 from mea_editor.electrode import Electrode
+from mea_editor.orientation_marker import OrientationMarker
 from mea_editor.pad import Pad
 
 
@@ -27,6 +29,19 @@ class UniqueIdTests(unittest.TestCase):
         self.assertEqual(electrodes[0].eid, 0)
         self.assertEqual(electrodes[1].eid, 1)
         self.assertEqual(pads[0].electrode_eid, 0)
+
+
+class UniqueMarkerIdTests(unittest.TestCase):
+    def test_duplicate_marker_id_keeps_first(self) -> None:
+        markers = [
+            OrientationMarker(marker_id=0, x=0.0, y=0.0, side=20.0),
+            OrientationMarker(marker_id=0, x=10.0, y=0.0, side=12.0),
+        ]
+        changes = ensure_unique_marker_ids(markers)
+        self.assertEqual(changes, 1)
+        self.assertEqual(markers[0].marker_id, 0)
+        self.assertEqual(markers[1].marker_id, 1)
+        self.assertEqual(markers[1].side, 12.0)
 
 
 class StatusFlagTests(unittest.TestCase):

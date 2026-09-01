@@ -3,7 +3,8 @@ Interactive graphics item bound to one Electrode model.
 
 It owns:
 - contact shape path (circle, square, or rect),
-- center / below labels from the visible electrode IDs,
+- center label from the visible electrode IDs,
+- outside labels (INTAN / extras) placed above, below, left, or right,
 - fill color that varies by shank (blues).
 
 Labels exist twice, once per mapping camera, so each view can position
@@ -34,7 +35,7 @@ class ElectrodeView(PerViewContactLabels, QGraphicsPathItem):
 
     It owns:
     - contact shape path (circle, square, or rect),
-    - center / below labels from the visible electrode IDs.
+    - center / outside labels from the visible electrode IDs.
     """
 
     def __init__(

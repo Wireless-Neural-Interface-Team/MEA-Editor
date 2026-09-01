@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from .attribute_schema import AttributeSpec, extra_specs
 from .electrode import Electrode
 from .electrode_array_editor_io import try_intan_channel_id
+from .orientation_marker import OrientationMarker
 from .pad import Pad
 
 
@@ -48,6 +49,27 @@ def ensure_unique_model_ids(models: list[Electrode], pads: list[Pad]) -> tuple[i
         next_pad_id = max(next_pad_id, pad.pad_id + 1)
 
     return eid_changes, pad_id_changes
+
+
+def ensure_unique_marker_ids(markers: list[OrientationMarker]) -> int:
+    """
+    Reassign colliding orientation-marker ids so dictionaries stay 1:1.
+
+    The first occurrence of an id is kept. Later duplicates get the next free id.
+    Returns the number of ids that were changed.
+    """
+    changes = 0
+    used: set[int] = set()
+    next_id = 0
+    for marker in markers:
+        if marker.marker_id in used:
+            while next_id in used:
+                next_id += 1
+            marker.marker_id = next_id
+            changes += 1
+        used.add(marker.marker_id)
+        next_id = max(next_id, marker.marker_id + 1)
+    return changes
 
 
 def pairing_problems(electrodes: Iterable[Electrode], pads: Iterable[Pad]) -> list[str]:

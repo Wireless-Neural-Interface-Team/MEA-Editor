@@ -1,9 +1,9 @@
 """
 I/O layer for the electrode array editor.
 
-Native format (Save / Open):
-    mea_editor JSON — electrodes, pads, extra attributes, shapes, map labels.
-    No probeinterface dependency.
+    Native format (Save / Open):
+    mea_editor JSON — electrodes, pads, orientation markers, extra attributes,
+    shapes, map labels, per-item label position. No probeinterface dependency.
 
 Legacy inputs still accepted:
     1) mea_editor JSON (current)
@@ -21,10 +21,11 @@ SpikeInterface export:
 
 XLSX exports:
     analysis table (channel / row / col) and a full array workbook
-    (electrodes sheet + pads sheet + attribute schema). Geometry uses
-    radius / width / height (circle: radius; square: width and height;
-    rect: independent extents). Extra electrode attributes follow the file
-    schema on both electrode and pad sheets.
+    (electrodes sheet + pads sheet + orientation-markers sheet + attribute
+    schema). Geometry uses radius / width / height (circle: radius; square:
+    width and height; rect: independent extents). Extra electrode attributes
+    follow the file schema on both electrode and pad sheets. Orientation
+    markers are Excel-only (not SpikeInterface contacts).
 """
 
 from __future__ import annotations
@@ -56,12 +57,20 @@ from .contact_shape import (
 from .electrode import (
     BUILTIN_ATTRIBUTE_KEYS,
     DEFAULT_INTAN_ID,
+    DEFAULT_LABEL_ORIENTATION,
+    DEFAULT_LABEL_POSITION,
     DEFAULT_MANUFACTURER_ID,
     DEFAULT_MAP_LABEL_KEYS,
     DEFAULT_PLANE_AXIS,
     DEFAULT_RADIUS,
     DEFAULT_SHAPE,
     Electrode,
+    normalize_label_orientation,
+    normalize_label_position,
+)
+from .orientation_marker import (
+    DEFAULT_MARKER_SIDE,
+    OrientationMarker,
 )
 from .pad import (
     DEFAULT_PAD_RADIUS,
@@ -69,7 +78,7 @@ from .pad import (
 )
 
 NATIVE_SPECIFICATION = "mea_editor"
-NATIVE_VERSION = "1.7"
+NATIVE_VERSION = "1.10"
 MIN_RADIUS = 0.001
 DEFAULT_UNITS = "um"
 PROBEINTERFACE_SPEC = "probeinterface"
@@ -122,6 +131,8 @@ _ELECTRODE_KNOWN_KEYS = frozenset(
         "contact_plane_axis",
         "shank_id",
         "shape",
+        "label_position",
+        "label_orientation",
         "channel_index",
         "contact_id",
         "attributes",
@@ -136,6 +147,7 @@ class ArrayDocument:
 
     electrodes: list[Electrode]
     pads: list[Pad] = field(default_factory=list)
+    orientation_markers: list[OrientationMarker] = field(default_factory=list)
     si_units: str = DEFAULT_UNITS
     electrode_attributes: list[AttributeSpec] = field(default_factory=list)
     map_labels: list[str] = field(default_factory=list)
@@ -363,6 +375,10 @@ def _electrode_from_native_dict(el: dict[str, Any], fallback_index: int) -> Elec
         contact_plane_axis=_parse_contact_plane_axis(el.get("contact_plane_axis")),
         shank_id=_as_str(el.get("shank_id"), ""),
         shape=shape,
+        label_position=normalize_label_position(el.get("label_position", DEFAULT_LABEL_POSITION)),
+        label_orientation=normalize_label_orientation(
+            el.get("label_orientation", DEFAULT_LABEL_ORIENTATION)
+        ),
         extra=_extra_from_electrode_dict(el),
     )
 
@@ -592,6 +608,10 @@ def _pad_from_native_dict(raw: dict[str, Any], fallback_index: int) -> Pad:
         radius=radius,
         height=height,
         shape=shape,
+        label_position=normalize_label_position(raw.get("label_position", DEFAULT_LABEL_POSITION)),
+        label_orientation=normalize_label_orientation(
+            raw.get("label_orientation", DEFAULT_LABEL_ORIENTATION)
+        ),
     )
 
 
@@ -608,12 +628,42 @@ def _load_pads_from_payload(data: dict[str, Any]) -> list[Pad]:
     return pads
 
 
+def _orientation_marker_from_native_dict(raw: dict[str, Any], fallback_index: int) -> OrientationMarker:
+    """Build an OrientationMarker from a native JSON object."""
+    marker_id = _as_int(raw.get("marker_id"), fallback_index)
+    side = max(_as_float(raw.get("side"), DEFAULT_MARKER_SIDE), MIN_RADIUS)
+    return OrientationMarker(
+        marker_id=marker_id,
+        x=_as_float(raw.get("x"), 0.0),
+        y=_as_float(raw.get("y"), 0.0),
+        side=side,
+        label_position=normalize_label_position(raw.get("label_position", DEFAULT_LABEL_POSITION)),
+        label_orientation=normalize_label_orientation(
+            raw.get("label_orientation", DEFAULT_LABEL_ORIENTATION)
+        ),
+    )
+
+
+def _load_orientation_markers_from_payload(data: dict[str, Any]) -> list[OrientationMarker]:
+    """Load orientation markers from native JSON. Missing lists yield an empty list."""
+    raw_list = data.get("orientation_markers")
+    if not isinstance(raw_list, list):
+        return []
+    markers: list[OrientationMarker] = []
+    for i, raw in enumerate(raw_list):
+        if not isinstance(raw, dict):
+            continue
+        markers.append(_orientation_marker_from_native_dict(raw, i))
+    return markers
+
+
 def load_array_document(path: str) -> ArrayDocument:
     """
     Load a full array document from a JSON file.
 
     Supported formats:
-    1) mea_editor native JSON (pads and map_labels optional on older files)
+    1) mea_editor native JSON (pads, orientation markers, map_labels,
+       label_position, and label_orientation optional on older files)
     2) legacy custom editor JSON
     3) probeinterface JSON (read without the probeinterface package)
 
@@ -635,6 +685,7 @@ def load_array_document(path: str) -> ArrayDocument:
         return ArrayDocument(
             electrodes=models,
             pads=pads,
+            orientation_markers=[],
             si_units=units,
             electrode_attributes=schema,
             map_labels=normalize_map_labels(map_labels_payload, schema),
@@ -644,6 +695,7 @@ def load_array_document(path: str) -> ArrayDocument:
         return ArrayDocument(
             electrodes=models,
             pads=_load_pads_from_payload(data),
+            orientation_markers=_load_orientation_markers_from_payload(data),
             si_units=units,
             electrode_attributes=schema,
             map_labels=normalize_map_labels(data.get("map_labels", _MISSING), schema),
@@ -715,6 +767,8 @@ def _electrode_to_native_dict(model: Electrode, schema: list[AttributeSpec] | No
         "contact_plane_axis": [float(v) for v in model.contact_plane_axis],
         "shank_id": str(model.shank_id),
         "shape": str(model.shape or DEFAULT_SHAPE),
+        "label_position": normalize_label_position(model.label_position),
+        "label_orientation": normalize_label_orientation(model.label_orientation),
     }
     extras = extra_specs(schema) if schema is not None else []
     attributes: dict[str, Any] = {}
@@ -738,6 +792,19 @@ def _pad_to_native_dict(model: Pad) -> dict[str, Any]:
         "radius": max(float(model.radius), MIN_RADIUS),
         "height": max(float(model.height), 0.0),
         "shape": str(model.shape or DEFAULT_PAD_SHAPE),
+        "label_position": normalize_label_position(model.label_position),
+        "label_orientation": normalize_label_orientation(model.label_orientation),
+    }
+
+
+def _orientation_marker_to_native_dict(model: OrientationMarker) -> dict[str, Any]:
+    return {
+        "marker_id": int(model.marker_id),
+        "x": float(model.x),
+        "y": float(model.y),
+        "side": max(float(model.side), MIN_RADIUS),
+        "label_position": normalize_label_position(model.label_position),
+        "label_orientation": normalize_label_orientation(model.label_orientation),
     }
 
 
@@ -748,18 +815,23 @@ def save_electrodes_to_file(
     pads: list[Pad] | None = None,
     electrode_attributes: list[AttributeSpec] | None = None,
     map_labels: Iterable[str] | None = None,
+    orientation_markers: list[OrientationMarker] | None = None,
 ) -> None:
     """
-    Save electrodes (and optional pads) in native mea_editor JSON format.
+    Save electrodes (and optional pads / orientation markers) in native
+    mea_editor JSON format.
 
     Extra electrode attributes and their schema are stored in the file so the
     editor can rebuild the same fields when the file is opened again.
-    Pads, contact shapes, geometry (including rect height), and visible map
-    labels are persisted.
+    Pads, orientation markers, contact shapes, geometry (including rect
+    height), visible map labels, and per-item label positions / orientations
+    are persisted. Label position and orientation are native JSON only:
+    SpikeInterface and XLSX exports omit them.
     """
     schema = list(electrode_attributes) if electrode_attributes is not None else schema_from_payload(None, electrodes)
     ordered = sorted(electrodes, key=lambda m: m.eid)
     ordered_pads = sorted(pads or [], key=lambda m: m.pad_id)
+    ordered_markers = sorted(orientation_markers or [], key=lambda m: m.marker_id)
     payload = {
         "specification": NATIVE_SPECIFICATION,
         "version": NATIVE_VERSION,
@@ -772,6 +844,7 @@ def save_electrodes_to_file(
         ),
         "electrodes": [_electrode_to_native_dict(m, schema) for m in ordered],
         "pads": [_pad_to_native_dict(m) for m in ordered_pads],
+        "orientation_markers": [_orientation_marker_to_native_dict(m) for m in ordered_markers],
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=4)
@@ -841,7 +914,8 @@ def build_probeinterface_payload(
     geometry) are stored in contact_annotations. The file-level attribute
     schema and visible map labels are stored on the probe so a reopened
     export keeps extra-field meaning and map display. Pads themselves are
-    not exported as SpikeInterface contacts.
+    not exported as SpikeInterface contacts. Per-item label position and
+    orientation are omitted (native JSON only).
     """
     if not electrodes:
         raise ValueError("No electrodes to export.")
@@ -988,11 +1062,27 @@ def _resolved_schema(
     return schema
 
 
+def _write_orientation_marker_sheet(workbook, orientation_markers: list[OrientationMarker] | None) -> None:
+    """Add an orientation_markers sheet (id, x, y, side). Always created."""
+    sheet = workbook.create_sheet("orientation_markers")
+    sheet.append(["marker_id", "x", "y", "side"])
+    for marker in sorted(orientation_markers or [], key=lambda item: item.marker_id):
+        sheet.append(
+            [
+                int(marker.marker_id),
+                float(marker.x),
+                float(marker.y),
+                max(float(marker.side), MIN_RADIUS),
+            ]
+        )
+
+
 def export_analysis_xlsx(
     path: str,
     electrodes: list[Electrode],
     pads: list[Pad] | None = None,
     electrode_attributes: list[AttributeSpec] | None = None,
+    orientation_markers: list[OrientationMarker] | None = None,
 ) -> None:
     """
     Write the analysis table used by downstream mapping scripts.
@@ -1008,6 +1098,9 @@ def export_analysis_xlsx(
     `si_channel` (SpikeInterface channel derived from INTAN; empty if invalid),
     manufacturer / shank / eid, extra attributes, and the first linked pad
     (`pad_id`, `pad_x`, `pad_y`, `pad_shape`).
+
+    Orientation markers are written on a separate `orientation_markers` sheet
+    (`marker_id`, `x`, `y`, `side`). They are not SpikeInterface contacts.
 
     `channel` is the Potentiostat ID, not the SpikeInterface channel.
     """
@@ -1065,6 +1158,7 @@ def export_analysis_xlsx(
         else:
             row.extend([int(pad.pad_id), float(pad.x), float(pad.y), pad.shape])
         worksheet.append(row)
+    _write_orientation_marker_sheet(workbook, orientation_markers)
     workbook.save(path)
     workbook.close()
 
@@ -1075,12 +1169,14 @@ def export_array_xlsx(
     pads: list[Pad] | None = None,
     electrode_attributes: list[AttributeSpec] | None = None,
     si_units: str = DEFAULT_UNITS,
+    orientation_markers: list[OrientationMarker] | None = None,
 ) -> None:
     """
-    Write a full array workbook: electrodes sheet, pads sheet, schema sheet.
+    Write a full array workbook: electrodes, pads, orientation markers, schema.
 
     Extra electrode attributes follow the file schema on both the electrode
-    sheet and the linked-electrode columns of the pads sheet.
+    sheet and the linked-electrode columns of the pads sheet. Orientation
+    markers are not linked to electrodes or pads.
     """
     if not electrodes:
         raise ValueError("No electrodes to export.")
@@ -1182,6 +1278,8 @@ def export_array_xlsx(
         ]
         row.extend(_extra_values(electrode, extras))
         pads_sheet.append(row)
+
+    _write_orientation_marker_sheet(workbook, orientation_markers)
 
     schema_sheet = workbook.create_sheet("electrode_attributes")
     schema_sheet.append(["key", "label", "type", "default", "builtin", "unique", "unique_scope"])
