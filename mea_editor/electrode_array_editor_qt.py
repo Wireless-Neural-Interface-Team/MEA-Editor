@@ -6,34 +6,49 @@ Architecture overview
 - `ElectrodeArrayView`: custom QGraphicsView for interaction + overlays (electrode_array_view.py)
 - `GridScene`: lightweight scene wrapper exposing dynamic X/Y axes (grid_scene.py)
 - `ElectrodeView`: visual/interactive representation of one `Electrode` (electrode_view.py)
+- `PadView`: visual/interactive representation of one `Pad` (pad_view.py)
 - `ElectrodeArrayEditorQt`: main window, business logic, file workflow (this file)
-- `electrode_array_editor_io`: load/save probeinterface JSON (electrode_array_editor_io.py)
+- `ElectrodeTableWindow`: non-modal table of all electrodes with search/filters
+- `attribute_schema`: file-level extra electrode attributes (this file rebuilds the panel from it)
+- `electrode_array_editor_io`: native mea_editor JSON + SpikeInterface / XLSX export
+
+Electrodes and pads share the same scene, shown in two side-by-side
+mapping views: the left view fits the electrodes, the right view fits the pads.
+Each contact keeps a label copy per camera so zooming one view does not move text in the other.
+Each contact uses a SpikeInterface shape (circle, square, or rect).
+Pads are interfaces toward other electronic systems and each pad is
+linked to one electrode.
 """
 
 from __future__ import annotations
 
-from collections import Counter
+from dataclasses import dataclass
 import importlib
 import threading
 
 try:
-    from PySide6.QtCore import QPoint, QRectF, QTimer, Qt
+    from PySide6.QtCore import QPointF, QRectF, QTimer, Qt
     from PySide6.QtGui import QAction, QKeySequence
     from PySide6.QtWidgets import (
         QApplication,
+        QCheckBox,
         QComboBox,
         QDialog,
         QFileDialog,
         QFormLayout,
         QFrame,
         QGraphicsScene,
+        QGroupBox,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QMainWindow,
         QMessageBox,
         QPushButton,
+        QScrollArea,
         QSizePolicy,
+        QSplitter,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -44,18 +59,84 @@ except ImportError as exc:
 # Do NOT run this file directly (python electrode_array_editor_qt.py) - it will fail with
 # ImportError: attempted relative import with no known parent package.
 # Use instead: python run.py (from project root), or mea-editor (when installed).
-from .electrode_array_dialogs import NewArrayDialog
-from .electrode_array_editor_io import load_electrodes_from_file, save_electrodes_to_file
-from .electrode import Electrode
-from .electrode_array_view import AXIS_BAND_HEIGHT, AXIS_BAND_WIDTH, ElectrodeArrayView
+from ._version import __version__
+from .array_integrity import (
+    ensure_unique_model_ids,
+    pairing_problems,
+    refresh_status_flags,
+)
+from .attribute_schema import (
+    AttributeSpec,
+    default_schema,
+    fill_electrode_extras,
+    fill_electrodes_extras,
+    parse_user_value,
+)
+from .contact_shape import (
+    DEFAULT_PAD_SHAPE,
+    contact_half_extents,
+    effective_half_height,
+    height_field_label,
+    normalize_contact_shape,
+    primary_size_field_label,
+    shape_uses_height,
+    size_field_from_stored_half,
+    stored_half_from_size_field,
+)
+from .electrode_array_dialogs import AddAttributeDialog, NewArrayDialog, NewArrayParams
+from .electrode_table_window import ElectrodeTableWindow
+from .electrode_array_editor_io import (
+    NATIVE_VERSION,
+    export_analysis_xlsx,
+    export_array_xlsx,
+    export_spikeinterface_json,
+    format_intan_id,
+    is_probeinterface_file,
+    load_array_document,
+    save_array_to_file,
+)
+from .electrode import (
+    DEFAULT_MAP_LABEL_KEYS,
+    DEFAULT_RADIUS,
+    DEFAULT_SHAPE,
+    ELECTRODE_SHAPES,
+    Electrode,
+    ElectrodeSnapshot,
+)
+from .electrode_array_view import ElectrodeArrayView
 from .electrode_view import ElectrodeView
 from .grid_scene import GridScene
+from .pad import (
+    DEFAULT_PAD_RADIUS,
+    PAD_SHAPES,
+    Pad,
+    PadSnapshot,
+)
+from .pad_layout import layout_pads_around_electrodes
+from .pad_view import PadView
 
 # Extra scene space around electrodes to allow panning/scrollbars.
 DEFAULT_SCENE_MARGIN = 100.0
+APP_NAME = "Electrode Array Editor"
 # Fit-view framing behavior.
 FIT_PADDING_MIN = 80.0
 FIT_PADDING_RATIO = 0.2
+TAB_ELECTRODES = 0
+TAB_PADS = 1
+MIXED_SHAPE_LABEL = "(mixed)"
+NEW_ARRAY_WARN_COUNT = 1024
+
+
+@dataclass(frozen=True)
+class EditorState:
+    """Full editor snapshot for undo/redo (electrodes, pads, schema, labels, units, path)."""
+
+    electrodes: dict[int, ElectrodeSnapshot]
+    pads: dict[int, PadSnapshot]
+    attribute_schema: tuple[AttributeSpec, ...]
+    map_labels: tuple[str, ...]
+    si_units: str
+    current_file_path: str | None
 
 
 class ElectrodeArrayEditorQt(QMainWindow):
@@ -70,43 +151,55 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Electrode Array Editor (Qt Standalone)")
-        self.resize(1280, 800)
+        self.setWindowTitle(f"{APP_NAME} v{__version__}")
+        self.resize(1600, 800)
         self.current_file_path: str | None = None
         self.is_dirty = False
         self.si_units = "um"
         self.is_add_mode = False
+        self.is_add_pad_mode = False
 
         # Canonical electrode models keyed by eid.
         self.electrodes: dict[int, Electrode] = {}
         # Scene items keyed by same eid for sync.
         self.items: dict[int, ElectrodeView] = {}
-        # Undo/redo: full snapshots of (x, y, radius, enabled, channel_index, contact_id, ...).
-        self.undo_stack: list[
-            dict[int, tuple[float, float, float, bool, int, str, tuple[float, float, float, float], str, str]]
-        ] = []
-        self.redo_stack: list[
-            dict[int, tuple[float, float, float, bool, int, str, tuple[float, float, float, float], str, str]]
-        ] = []
+        # Canonical pad models keyed by pad_id.
+        self.pads: dict[int, Pad] = {}
+        self.pad_items: dict[int, PadView] = {}
+        # File-level electrode attribute schema (built-ins + extras).
+        self.attribute_schema: list[AttributeSpec] = default_schema()
+        self.attribute_edits: dict[str, QLineEdit] = {}
+        self.visible_map_label_keys: set[str] = set(DEFAULT_MAP_LABEL_KEYS)
+        self._map_label_checks: dict[str, QCheckBox] = {}
+        self._map_label_actions: dict[str, QAction] = {}
+        self._view_labels_menu = None
+        self._map_labels_layout: QVBoxLayout | None = None
+        self.undo_stack: list[EditorState] = []
+        self.redo_stack: list[EditorState] = []
         self._max_history = 200
         self._is_restoring_state = False
-        # Snapshot taken at mouse press; committed on release if changed.
-        self._interaction_snapshot: (
-            dict[int, tuple[float, float, float, bool, int, str, tuple[float, float, float, float], str, str]]
-            | None
-        ) = None
+        self._is_mutating_scene = False
+        self._is_syncing_selection = False
+        self._auto_selected_electrode_eids: set[int] = set()
+        self._auto_selected_pad_ids: set[int] = set()
+        self._clean_state: EditorState | None = None
+        self._electrode_table_window: ElectrodeTableWindow | None = None
 
         self.scene = GridScene(self)
         self.scene.set_axes_provider(self._grid_axes)
-        self.scene.selectionChanged.connect(self._refresh_panel_values)
-        self.view = ElectrodeArrayView(self.scene)
-        self.view.set_interaction_callbacks(self._on_interaction_begin, self._on_interaction_end)
-        self.view.set_add_callbacks(lambda: self.is_add_mode, self._add_electrode_at)
-        self.view.set_delete_callback(self._delete_selected)
-        self.view.set_view_transform_changed_callback(self._refresh_label_layouts)
+        self.scene.selectionChanged.connect(self._on_scene_selection_changed)
+        self.electrode_view = self._create_map_view()
+        self.pads_map_view = self._create_map_view()
+        self.view = self.electrode_view
+        self.scene.active_view = self.electrode_view
+        self.scene.electrode_map_view = self.electrode_view
+        self.scene.pad_map_view = self.pads_map_view
+        self.electrode_view.set_activated_callback(lambda: self._set_active_map_view(self.electrode_view))
+        self.pads_map_view.set_activated_callback(lambda: self._set_active_map_view(self.pads_map_view))
 
         self._build_ui()
         self._build_menu()
+        self._clean_state = self._capture_state()
         self._startup_done = False
         self._preload_thread: threading.Thread | None = None
         self._preload_started = False
@@ -115,7 +208,7 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """
         Prompt to save before closing if there are unsaved changes.
         """
-        if self.electrodes and self.is_dirty:
+        if self.is_dirty:
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Warning)
             msg.setWindowTitle("Unsaved changes")
@@ -147,144 +240,342 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self._startup_done = True
             QTimer.singleShot(0, self._startup_workflow)
         else:
-            QTimer.singleShot(0, self._fit_view)
+            QTimer.singleShot(0, self._fit_all_views)
+
+    def _create_map_view(self) -> ElectrodeArrayView:
+        """Build a mapping viewport bound to the shared scene."""
+        view = ElectrodeArrayView(self.scene)
+        view.set_add_callbacks(
+            lambda: self.is_add_mode or self.is_add_pad_mode,
+            self._add_point_at,
+        )
+        view.set_delete_callback(self._delete_selected)
+        view.set_view_transform_changed_callback(self._refresh_label_layouts)
+        view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        return view
 
     def _build_ui(self) -> None:
         """
-        Build interface: view on left, side panel on right.
+        Build interface: mapping views on the left, inspector on the right.
 
-        Panel contains: selection, si_units, edit fields, move, tools
-        (add, toggle enabled, fit), help.
+        The scene shows electrodes and pads together. Two cameras share it,
+        side by side: Electrodes (left, fitted to the array) and Pads (right).
+        The inspector is grouped by task: array settings, selection, then
+        Electrodes / Pads tabs.
         """
-        # Central widget and horizontal layout (view | panel).
         central = QWidget(self)
         self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
-        layout.setContentsMargins(8, 8, 8, 8)
+        outer = QHBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(0)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        outer.addWidget(splitter)
+
+        self.map_splitter = QSplitter(Qt.Horizontal)
+        self.map_splitter.setChildrenCollapsible(False)
+        self.map_splitter.addWidget(self.electrode_view)
+        self.map_splitter.addWidget(self.pads_map_view)
+        self.map_splitter.setStretchFactor(0, 1)
+        self.map_splitter.setStretchFactor(1, 1)
+        self.map_splitter.setSizes([560, 560])
+        splitter.addWidget(self.map_splitter)
+        splitter.addWidget(self._build_side_panel())
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([1120, 340])
+
+        self.statusBar().showMessage(
+            "Wheel: zoom  |  Middle-drag: pan  |  Del: delete  |  Ctrl+Z: undo"
+        )
+        self.statusBar().addPermanentWidget(QLabel(f"v{__version__}"))
+
+    def _build_side_panel(self) -> QWidget:
+        """Inspector: array, selection, then electrode/pad parameterization."""
+        panel = QWidget()
+        panel.setMinimumWidth(300)
+        panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(4, 0, 0, 0)
         layout.setSpacing(8)
 
-        # View on left, stretch 4 to take most space.
-        self.view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.view, stretch=4)
+        layout.addWidget(self._build_array_group())
+        layout.addWidget(self._build_map_labels_group())
+        layout.addWidget(self._build_selection_group())
 
-        # Right side panel, stretch 1.
-        panel = QWidget()
-        panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(0, 0, 0, 0)
-        panel_layout.setSpacing(8)
-        layout.addWidget(panel, stretch=1)
+        self.point_tabs = QTabWidget()
+        self.point_tabs.addTab(self._build_electrode_tab(), "Electrodes")
+        self.point_tabs.addTab(self._build_pad_tab(), "Pads")
+        self.point_tabs.currentChanged.connect(self._on_point_tab_changed)
+        layout.addWidget(self.point_tabs, stretch=1)
+        return panel
 
-        def make_row(*widgets):
-            """Compact helper to place multiple widgets on one form row (edit + button)."""
-            row = QWidget()
-            lo = QHBoxLayout(row)
-            lo.setContentsMargins(0, 0, 0, 0)
-            lo.setSpacing(4)
-            for w in widgets:
-                lo.addWidget(w)
-            return row
+    @staticmethod
+    def _make_row(*widgets: QWidget) -> QWidget:
+        """Place several widgets on one form row (field + button, X + Y, …)."""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        for widget in widgets:
+            if isinstance(widget, QPushButton):
+                widget.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Fixed)
+                layout.addWidget(widget)
+            else:
+                layout.addWidget(widget, stretch=1)
+        return row
 
-        # Selection block: selected count + si_units.
-        sel_box = QFrame()
-        sel_box.setFrameShape(QFrame.StyledPanel)
-        sel_form = QFormLayout(sel_box)
-        self.selected_count_label = QLabel("0")
+    @staticmethod
+    def _form_layout(parent: QWidget) -> QFormLayout:
+        """Shared form metrics so inspector groups align."""
+        form = QFormLayout(parent)
+        form.setContentsMargins(8, 10, 8, 8)
+        form.setHorizontalSpacing(8)
+        form.setVerticalSpacing(6)
+        return form
+
+    @staticmethod
+    def _scroll_area(inner: QWidget) -> QScrollArea:
+        """Vertical-only scroll wrapper for a tab's property groups."""
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        return scroll
+
+    def _build_array_group(self) -> QGroupBox:
+        """File-level settings that do not depend on the current selection."""
+        box = QGroupBox("Array")
+        form = self._form_layout(box)
         self.si_units_edit = QLineEdit(self.si_units)
-        b_units = QPushButton("Apply si_units")
+        self.si_units_edit.setPlaceholderText("um, mm, …")
+        self.si_units_edit.setToolTip("Distance unit stored in the file.")
+        b_units = QPushButton("Apply")
+        b_units.setAutoDefault(False)
         b_units.clicked.connect(self._apply_si_units)
-        units_row = QWidget()
-        units_layout = QHBoxLayout(units_row)
-        units_layout.setContentsMargins(0, 0, 0, 0)
-        units_layout.setSpacing(4)
-        units_layout.addWidget(self.si_units_edit)
-        units_layout.addWidget(b_units)
-        sel_form.addRow("Selected", self.selected_count_label)
-        sel_form.addRow("si_units", units_row)
-        self.contact_find_edit = QLineEdit("")
-        self.contact_find_edit.setPlaceholderText("e.g. A-001")
-        self.contact_find_edit.setClearButtonEnabled(True)
-        b_find_contact = QPushButton("Find")
-        b_find_contact.clicked.connect(self._find_by_contact_id)
-        self.contact_find_edit.returnPressed.connect(self._find_by_contact_id)
-        sel_form.addRow("Find contact ID", make_row(self.contact_find_edit, b_find_contact))
-        panel_layout.addWidget(sel_box)
+        b_fit = QPushButton("Fit View")
+        b_fit.setAutoDefault(False)
+        b_fit.setToolTip("Fit both mapping views: electrodes on the left, pads on the right.")
+        b_fit.clicked.connect(self._fit_view)
+        b_table = QPushButton("Electrode table")
+        b_table.setAutoDefault(False)
+        b_table.setToolTip("Open a table of all electrodes. The editor stays usable while it is open.")
+        b_table.clicked.connect(self._show_electrode_table)
+        form.addRow("si_units", self._make_row(self.si_units_edit, b_units))
+        form.addRow(self._make_row(b_fit, b_table))
+        return box
 
-        # Edit block: radius, X/Y, channel, contact_id, plane_axis, shank, shape.
-        edit_box = QFrame()
-        edit_box.setFrameShape(QFrame.StyledPanel)
-        e_form = QFormLayout(edit_box)
-        self.radius_edit = QLineEdit("")
-        self.x_edit = QLineEdit("")
-        self.y_edit = QLineEdit("")
-        self.channel_index_edit = QLineEdit("")
-        self.contact_id_edit = QLineEdit("")
-        self.contact_plane_axis_edit = QLineEdit("")
-        self.shank_id_edit = QLineEdit("")
-        self.shape_combo = QComboBox()
-        self.shape_combo.addItems(["circle"])
+    def _build_map_labels_group(self) -> QGroupBox:
+        """Choose which electrode IDs are drawn on both mapping views."""
+        box = QGroupBox("Map labels")
+        box.setToolTip(
+            "Choose which electrode IDs are drawn on both mapping views. "
+            "The list matches the attributes in the Electrodes tab."
+        )
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(8, 10, 8, 8)
+        layout.setSpacing(4)
+        self._map_labels_layout = layout
+        self._rebuild_map_label_checks()
+        return box
+
+    def _build_selection_group(self) -> QGroupBox:
+        """Selection summary and group translation (electrodes and pads)."""
+        box = QGroupBox("Selection")
+        form = self._form_layout(box)
+        self.selected_count_label = QLabel("0 electrode(s), 0 pad(s)")
         self.dx_edit = QLineEdit("0")
         self.dy_edit = QLineEdit("0")
+        self.dx_edit.setToolTip("Horizontal offset applied to the current selection.")
+        self.dy_edit.setToolTip("Vertical offset applied to the current selection.")
+        b_move = QPushButton("Move")
+        b_move.setAutoDefault(False)
+        b_move.clicked.connect(self._move_selection_by_delta)
+        form.addRow("Selected", self.selected_count_label)
+        form.addRow("dX / dY", self._make_row(self.dx_edit, self.dy_edit, b_move))
+        return box
+
+    def _build_electrode_tab(self) -> QWidget:
+        """Find, geometry, attributes, then add/delete actions."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setSpacing(8)
+
+        find_box = QGroupBox("Find")
+        find_form = self._form_layout(find_box)
+        self.attribute_find_edit = QLineEdit("")
+        self.attribute_find_edit.setPlaceholderText("any attribute value")
+        self.attribute_find_edit.setToolTip(
+            "Search all electrode attributes (INTAN ID, potentiostat, manufacturer, shank, extras). "
+            "Every matching electrode is selected."
+        )
+        self.attribute_find_edit.setClearButtonEnabled(True)
+        b_find_attribute = QPushButton("Find")
+        b_find_attribute.setAutoDefault(False)
+        b_find_attribute.clicked.connect(self._find_by_attributes)
+        self.attribute_find_edit.returnPressed.connect(self._find_by_attributes)
+        find_form.addRow("Attributes", self._make_row(self.attribute_find_edit, b_find_attribute))
+        layout.addWidget(find_box)
+
+        geom_box = QGroupBox("Geometry")
+        e_form = self._form_layout(geom_box)
+        self.radius_edit = QLineEdit("")
+        self.height_edit = QLineEdit("")
+        self.x_edit = QLineEdit("")
+        self.y_edit = QLineEdit("")
+        self.x_edit.setToolTip("Requires exactly one selected electrode. Leave empty to keep X/Y.")
+        self.y_edit.setToolTip("Requires exactly one selected electrode. Leave empty to keep X/Y.")
+        self.contact_plane_axis_edit = QLineEdit("")
+        self.contact_plane_axis_edit.setPlaceholderText("x0, x1, y0, y1")
+        self.shape_combo = QComboBox()
+        self.shape_combo.addItems(list(ELECTRODE_SHAPES))
+        self.electrode_size_label = QLabel(primary_size_field_label(DEFAULT_SHAPE))
+        self.electrode_height_label = QLabel(height_field_label())
+        self._electrode_size_shape = DEFAULT_SHAPE
+        e_form.addRow("Shape", self.shape_combo)
+        e_form.addRow(self.electrode_size_label, self.radius_edit)
+        e_form.addRow(self.electrode_height_label, self.height_edit)
+        e_form.addRow("X / Y", self._make_row(self.x_edit, self.y_edit))
+        e_form.addRow("Contact plane", self.contact_plane_axis_edit)
+        self._electrode_geom_form = e_form
+        self.shape_combo.currentTextChanged.connect(self._on_electrode_shape_combo_changed)
+        self._set_height_row_visible(
+            e_form,
+            self.electrode_height_label,
+            self.height_edit,
+            shape_uses_height(DEFAULT_SHAPE),
+        )
+
+        attributes_box = QGroupBox("Attributes")
+        attributes_outer = QVBoxLayout(attributes_box)
+        attributes_outer.setContentsMargins(8, 10, 8, 8)
+        attributes_outer.setSpacing(6)
+        self.attributes_form = QFormLayout()
+        self.attributes_form.setContentsMargins(0, 0, 0, 0)
+        self.attributes_form.setHorizontalSpacing(8)
+        self.attributes_form.setVerticalSpacing(6)
+        attributes_outer.addLayout(self.attributes_form)
+        self.b_add_attribute = QPushButton("Add attribute")
+        self.b_add_attribute.setAutoDefault(False)
+        self.b_add_attribute.clicked.connect(self._add_attribute_interactive)
+        attributes_outer.addWidget(self.b_add_attribute)
+        self._rebuild_attribute_fields()
 
         self.b_apply_edits = QPushButton("Confirm electrode edits")
+        self.b_apply_edits.setAutoDefault(False)
         self.b_apply_edits.clicked.connect(self._apply_pending_edits)
 
-        e_form.addRow("Radius", self.radius_edit)
-        e_form.addRow("X/Y (single)", make_row(self.x_edit, self.y_edit))
-        e_form.addRow("Channel index", self.channel_index_edit)
-        e_form.addRow("Contact ID", self.contact_id_edit)
-        e_form.addRow("Contact plane axis", self.contact_plane_axis_edit)
-        e_form.addRow("Shank ID", self.shank_id_edit)
-        e_form.addRow("Shape", self.shape_combo)
-        e_form.addRow(self.b_apply_edits)
-        panel_layout.addWidget(edit_box)
+        scroll_inner = QWidget()
+        scroll_layout = QVBoxLayout(scroll_inner)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(8)
+        scroll_layout.addWidget(geom_box)
+        scroll_layout.addWidget(attributes_box)
+        scroll_layout.addStretch(1)
+        layout.addWidget(self._scroll_area(scroll_inner), stretch=1)
+        layout.addWidget(self.b_apply_edits)
 
-        # Move block: dX, dY to move selection.
-        move_box = QFrame()
-        move_box.setFrameShape(QFrame.StyledPanel)
-        move_form = QFormLayout(move_box)
-        b_move = QPushButton("Move Selection dX/dY")
-        b_move.clicked.connect(self._move_selection_by_delta)
-        move_form.addRow("dX (group)", self.dx_edit)
-        move_form.addRow("dY (group)", self.dy_edit)
-        move_form.addRow(b_move)
-        panel_layout.addWidget(move_box)
-
-        # Tools block: add electrode, toggle enabled, fit view.
-        tools_box = QFrame()
-        tools_box.setFrameShape(QFrame.StyledPanel)
-        t_form = QFormLayout(tools_box)
+        tools = QGroupBox("Actions")
+        tools_form = self._form_layout(tools)
         self.b_add_electrode = QPushButton("Add Electrode")
         self.b_add_electrode.setCheckable(True)
+        self.b_add_electrode.setAutoDefault(False)
         self.b_add_electrode.toggled.connect(self._set_add_mode)
-        b_delete = QPushButton("Delete Selected Electrode")
-        b_delete.clicked.connect(self._delete_selected)
-        b_toggle = QPushButton("Toggle Enabled")
-        b_toggle.clicked.connect(self._toggle_enabled)
-        b_fit = QPushButton("Fit View")
-        b_fit.clicked.connect(self._fit_view)
-        t_form.addRow(self.b_add_electrode)
-        t_form.addRow(b_delete)
-        t_form.addRow(b_toggle)
-        t_form.addRow(b_fit)
-        panel_layout.addWidget(tools_box)
+        b_delete = QPushButton("Delete selected")
+        b_delete.setAutoDefault(False)
+        b_delete.clicked.connect(self._delete_selected_electrodes)
+        tools_form.addRow(self.b_add_electrode)
+        tools_form.addRow(b_delete)
+        layout.addWidget(tools)
+        return tab
 
-        help_label = QLabel(
-            "Click: select one\n"
-            "Ctrl+Click: add/remove from selection\n"
-            "Drag empty area: box selection\n"
-            "Move: use X/Y or dX/dY in the panel\n"
-            "Suppr/Backspace: delete selected\n"
-            "Wheel: zoom"
+    def _build_pad_tab(self) -> QWidget:
+        """Find, properties, then add/delete actions."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setSpacing(8)
+
+        find_box = QGroupBox("Find")
+        find_form = self._form_layout(find_box)
+        self.pad_id_find_edit = QLineEdit("")
+        self.pad_id_find_edit.setPlaceholderText("e.g. 3")
+        self.pad_id_find_edit.setClearButtonEnabled(True)
+        b_find_pad = QPushButton("Find")
+        b_find_pad.setAutoDefault(False)
+        b_find_pad.clicked.connect(self._find_by_pad_id)
+        self.pad_id_find_edit.returnPressed.connect(self._find_by_pad_id)
+        find_form.addRow("Pad ID", self._make_row(self.pad_id_find_edit, b_find_pad))
+        layout.addWidget(find_box)
+
+        pad_edit_box = QGroupBox("Properties")
+        p_form = self._form_layout(pad_edit_box)
+        self.pad_id_edit = QLineEdit("")
+        self.pad_id_edit.setReadOnly(True)
+        self.pad_id_edit.setToolTip("Editor-assigned identifier (like electrode ID). Not editable.")
+        self.pad_radius_edit = QLineEdit("")
+        self.pad_height_edit = QLineEdit("")
+        self.pad_x_edit = QLineEdit("")
+        self.pad_y_edit = QLineEdit("")
+        self.pad_x_edit.setToolTip("Requires exactly one selected pad. Leave empty to keep X/Y.")
+        self.pad_y_edit.setToolTip("Requires exactly one selected pad. Leave empty to keep X/Y.")
+        self.pad_electrode_combo = QComboBox()
+        self.pad_shape_combo = QComboBox()
+        self.pad_shape_combo.addItems(list(PAD_SHAPES))
+        self.pad_size_label = QLabel(primary_size_field_label(DEFAULT_PAD_SHAPE))
+        self.pad_height_label = QLabel(height_field_label())
+        self._pad_size_shape = DEFAULT_PAD_SHAPE
+        p_form.addRow("Pad ID", self.pad_id_edit)
+        p_form.addRow("Shape", self.pad_shape_combo)
+        p_form.addRow(self.pad_size_label, self.pad_radius_edit)
+        p_form.addRow(self.pad_height_label, self.pad_height_edit)
+        p_form.addRow("X / Y", self._make_row(self.pad_x_edit, self.pad_y_edit))
+        p_form.addRow("Associated electrode", self.pad_electrode_combo)
+        self._pad_form = p_form
+        self.pad_shape_combo.currentTextChanged.connect(self._on_pad_shape_combo_changed)
+        self._set_height_row_visible(
+            p_form,
+            self.pad_height_label,
+            self.pad_height_edit,
+            shape_uses_height(DEFAULT_PAD_SHAPE),
         )
-        help_label.setWordWrap(True)
-        panel_layout.addWidget(help_label)
-        panel_layout.addStretch(1)
+
+        self.b_apply_pad_edits = QPushButton("Confirm pad edits")
+        self.b_apply_pad_edits.setAutoDefault(False)
+        self.b_apply_pad_edits.clicked.connect(self._apply_pending_pad_edits)
+
+        scroll_inner = QWidget()
+        scroll_layout = QVBoxLayout(scroll_inner)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(8)
+        scroll_layout.addWidget(pad_edit_box)
+        scroll_layout.addStretch(1)
+        layout.addWidget(self._scroll_area(scroll_inner), stretch=1)
+        layout.addWidget(self.b_apply_pad_edits)
+
+        tools = QGroupBox("Actions")
+        tools_form = self._form_layout(tools)
+        self.pad_add_electrode_combo = QComboBox()
+        self.pad_add_electrode_combo.setMaxVisibleItems(20)
+        self.b_add_pad = QPushButton("Add Pad")
+        self.b_add_pad.setCheckable(True)
+        self.b_add_pad.setAutoDefault(False)
+        self.b_add_pad.toggled.connect(self._set_add_pad_mode)
+        b_delete_pad = QPushButton("Delete selected")
+        b_delete_pad.setAutoDefault(False)
+        b_delete_pad.clicked.connect(self._delete_selected_pads)
+        tools_form.addRow("Electrode for new pad", self.pad_add_electrode_combo)
+        tools_form.addRow(self.b_add_pad)
+        tools_form.addRow(b_delete_pad)
+        layout.addWidget(tools)
+        return tab
 
     def _build_menu(self) -> None:
         """
-        Create File menu with New, Open, Save, Save As, Export xlsx.
-
-        Each action is connected to its handler and keyboard shortcut.
+        Create File, View, and Help menus.
         """
         file_menu = self.menuBar().addMenu("File")
         act_new = QAction("New array...", self)
@@ -307,45 +598,299 @@ class ElectrodeArrayEditorQt(QMainWindow):
         act_save_as.triggered.connect(self._menu_save_array_as)
         file_menu.addAction(act_save_as)
 
+        file_menu.addSeparator()
+
+        act_export_si = QAction("Export for SpikeInterface...", self)
+        act_export_si.triggered.connect(self._menu_export_spikeinterface)
+        file_menu.addAction(act_export_si)
+
+        act_export_analysis = QAction("Export for analysis...", self)
+        act_export_analysis.triggered.connect(self._menu_export_analysis)
+        file_menu.addAction(act_export_analysis)
+
         act_export_xlsx = QAction("Export array as XLSX...", self)
         act_export_xlsx.triggered.connect(self._menu_export_matrix_xlsx)
         file_menu.addAction(act_export_xlsx)
 
-    def _selected_items(self) -> list[ElectrodeView]:
-        """
-        Return currently selected items, filtered to ElectrodeView.
+        edit_menu = self.menuBar().addMenu("Edit")
+        act_undo = QAction("Undo", self)
+        act_undo.setShortcut(QKeySequence.Undo)
+        act_undo.triggered.connect(self._undo)
+        edit_menu.addAction(act_undo)
+        act_redo = QAction("Redo", self)
+        act_redo.setShortcut(QKeySequence.Redo)
+        act_redo.triggered.connect(self._redo)
+        edit_menu.addAction(act_redo)
 
-        Returns:
-            List of selected ElectrodeView (excludes other item types).
-        """
+        view_menu = self.menuBar().addMenu("View")
+        act_fit = QAction("Fit View", self)
+        act_fit.setShortcut(QKeySequence("Ctrl+0"))
+        act_fit.triggered.connect(self._fit_view)
+        view_menu.addAction(act_fit)
+        act_table = QAction("Electrode table...", self)
+        act_table.setShortcut(QKeySequence("Ctrl+T"))
+        act_table.triggered.connect(self._show_electrode_table)
+        view_menu.addAction(act_table)
+        self._view_labels_menu = view_menu.addMenu("Map labels")
+        self._rebuild_map_label_menu()
+
+        help_menu = self.menuBar().addMenu("Help")
+        act_shortcuts = QAction("Keyboard shortcuts...", self)
+        act_shortcuts.triggered.connect(self._show_shortcuts)
+        help_menu.addAction(act_shortcuts)
+        help_menu.addSeparator()
+        act_about = QAction("About...", self)
+        act_about.triggered.connect(self._show_about)
+        help_menu.addAction(act_about)
+
+    def _show_shortcuts(self) -> None:
+        """Show interaction shortcuts that used to occupy the side panel."""
+        QMessageBox.information(
+            self,
+            "Keyboard shortcuts",
+            "Click: select one\n"
+            "Ctrl+Click: add/remove from selection\n"
+            "Drag empty area: box selection\n"
+            "Middle-drag: pan the view\n"
+            "Wheel: zoom\n"
+            "Move: X/Y on one item, or dX/dY on the selection\n"
+            "Add Electrode: click the scene\n"
+            "Add Pad: choose an electrode, then click the scene\n"
+            "Delete / Backspace: delete selected\n"
+            "Ctrl+Z / Ctrl+Y: undo / redo\n"
+            "Ctrl+0: fit both mapping views (electrodes and pads)\n"
+            "Ctrl+T: electrode table\n"
+            "View > Map labels: choose IDs drawn on both maps",
+        )
+
+    def _show_about(self) -> None:
+        """Show application name, version, and native file format."""
+        QMessageBox.about(
+            self,
+            f"About {APP_NAME}",
+            f"<h3>{APP_NAME} {__version__}</h3>"
+            "<p>GUI and library to create and modify Multi-Electrode Arrays.</p>"
+            f"<p>Native file format: mea_editor {NATIVE_VERSION}</p>"
+            "<p>Keep native JSON as the source of truth. SpikeInterface and XLSX "
+            "are exports.</p>"
+            "<p>License: MIT<br>"
+            "Wireless Neural Interface Team</p>",
+        )
+
+    def _selected_electrode_items(self) -> list[ElectrodeView]:
+        """Return currently selected items, filtered to ElectrodeView."""
         return [it for it in self.scene.selectedItems() if isinstance(it, ElectrodeView)]
 
-    def _find_by_contact_id(self) -> None:
+    def _selected_pad_items(self) -> list[PadView]:
+        """Return currently selected items, filtered to PadView."""
+        return [it for it in self.scene.selectedItems() if isinstance(it, PadView)]
+
+    def _on_scene_selection_changed(self) -> None:
+        """Keep associated pads and electrodes selected together, then refresh the panel."""
+        if self._is_mutating_scene:
+            return
+        self._sync_associated_selection()
+        self._refresh_panel_values()
+
+    def _sync_associated_selection(self) -> None:
+        """Select each pad's electrode and each electrode's pad; drop stale auto-selections."""
+        if self._is_syncing_selection or self._is_restoring_state:
+            return
+        self._is_syncing_selection = True
+        try:
+            self._sync_associated_electrodes_from_pads()
+            self._sync_associated_pads_from_electrodes()
+        finally:
+            self._is_syncing_selection = False
+
+    def _sync_associated_electrodes_from_pads(self) -> None:
+        """Select each pad's electrode; drop auto-selected electrodes that are no longer needed."""
+        needed = {
+            item.model.electrode_eid
+            for item in self._selected_pad_items()
+            if item.model.electrode_eid in self.items
+        }
+        stale = {eid for eid in self._auto_selected_electrode_eids if eid not in needed}
+        to_add = {eid for eid in needed if not self.items[eid].isSelected()}
+        for eid in stale:
+            if eid in self.items:
+                self.items[eid].setSelected(False)
+        self._auto_selected_electrode_eids -= stale
+        for eid in to_add:
+            self.items[eid].setSelected(True)
+            self._auto_selected_electrode_eids.add(eid)
+
+    def _sync_associated_pads_from_electrodes(self) -> None:
+        """Select each electrode's pad; drop auto-selected pads that are no longer needed."""
+        selected_eids = {item.model.eid for item in self._selected_electrode_items()}
+        needed = {
+            pad_id
+            for pad_id, pad in self.pads.items()
+            if pad.electrode_eid in selected_eids and pad_id in self.pad_items
+        }
+        stale = {pad_id for pad_id in self._auto_selected_pad_ids if pad_id not in needed}
+        to_add = {pad_id for pad_id in needed if not self.pad_items[pad_id].isSelected()}
+        for pad_id in stale:
+            if pad_id in self.pad_items:
+                self.pad_items[pad_id].setSelected(False)
+        self._auto_selected_pad_ids -= stale
+        for pad_id in to_add:
+            self.pad_items[pad_id].setSelected(True)
+            self._auto_selected_pad_ids.add(pad_id)
+
+    def _on_point_tab_changed(self, index: int) -> None:
+        """Stop the other add-mode when switching parameterization tabs."""
+        if not hasattr(self, "b_add_pad") or not hasattr(self, "b_add_electrode"):
+            return
+        if index == TAB_ELECTRODES and self.b_add_pad.isChecked():
+            self.b_add_pad.setChecked(False)
+        elif index == TAB_PADS and self.b_add_electrode.isChecked():
+            self.b_add_electrode.setChecked(False)
+
+    def _set_active_map_view(self, view: ElectrodeArrayView) -> None:
+        """Remember which mapping viewport last received interaction."""
+        self.view = view
+        self.scene.active_view = view
+
+    def _show_electrode_table(self) -> None:
+        """Open (or raise) the non-modal table of all electrodes."""
+        if self._electrode_table_window is None:
+            self._electrode_table_window = ElectrodeTableWindow(self)
+            self._electrode_table_window.electrodes_chosen.connect(self._select_from_electrode_table)
+        selected = {item.model.eid for item in self._selected_electrode_items()}
+        self._electrode_table_window.reload(
+            self.electrodes.values(),
+            self.pads.values(),
+            self.attribute_schema,
+            selected_eids=selected,
+            scroll_to_selection=True,
+        )
+        self._electrode_table_window.show()
+        self._electrode_table_window.raise_()
+        self._electrode_table_window.activateWindow()
+
+    def _sync_electrode_table(self, *, reload_data: bool) -> None:
+        """Keep the electrode table in sync with the current array and selection."""
+        win = self._electrode_table_window
+        if win is None or not win.isVisible():
+            return
+        selected = {item.model.eid for item in self._selected_electrode_items()}
+        if reload_data:
+            win.reload(
+                self.electrodes.values(),
+                self.pads.values(),
+                self.attribute_schema,
+                selected_eids=selected,
+            )
+            return
+        win.set_selected_eids(selected)
+
+    def _select_from_electrode_table(self, eids: list[int]) -> None:
+        """Select table-chosen electrodes in both mapping views (pads follow)."""
+        if self._is_syncing_selection or self._is_restoring_state:
+            return
+        matches = [self.items[eid] for eid in eids if eid in self.items]
+        self.scene.clearSelection()
+        self._auto_selected_electrode_eids.clear()
+        self._auto_selected_pad_ids.clear()
+        for item in matches:
+            item.setSelected(True)
+        if not matches:
+            return
+        united = matches[0].sceneBoundingRect()
+        for item in matches[1:]:
+            united = united.united(item.sceneBoundingRect())
+        pad = 40.0
+        self.electrode_view.ensureVisible(united.adjusted(-pad, -pad, pad, pad), 80, 80)
+        selected_eids = {item.model.eid for item in matches}
+        pad_items = [
+            item for item in self.pad_items.values() if item.model.electrode_eid in selected_eids
+        ]
+        if pad_items:
+            pad_rect = pad_items[0].sceneBoundingRect()
+            for item in pad_items[1:]:
+                pad_rect = pad_rect.united(item.sceneBoundingRect())
+            self.pads_map_view.ensureVisible(pad_rect.adjusted(-pad, -pad, pad, pad), 80, 80)
+
+    def _find_by_pad_id(self) -> None:
         """
-        Select electrode(s) whose contact_id matches the find field and scroll the view to them.
+        Select the pad whose editor-assigned ID matches the find field and scroll to it.
+        """
+        query = self.pad_id_find_edit.text().strip()
+        if not query:
+            QMessageBox.information(self, "Find Pad ID", "Enter a Pad ID to search.")
+            return
+        if not self.pad_items:
+            QMessageBox.information(self, "Find Pad ID", "No pads in the current array.")
+            return
+        try:
+            pad_id = int(query)
+        except ValueError:
+            QMessageBox.information(self, "Find Pad ID", "Pad ID must be an integer.")
+            return
+
+        item = self.pad_items.get(pad_id)
+        if item is None:
+            QMessageBox.information(
+                self,
+                "Pad ID not found",
+                f"No pad has ID {pad_id}.",
+            )
+            return
+
+        self.scene.clearSelection()
+        item.setSelected(True)
+        pad = 40.0
+        united = item.sceneBoundingRect().adjusted(-pad, -pad, pad, pad)
+        self.pads_map_view.ensureVisible(united, 80, 80)
+        self.point_tabs.setCurrentIndex(TAB_PADS)
+        self._refresh_panel_values()
+
+    def _electrode_attribute_texts(self, model: Electrode) -> list[str]:
+        """String forms of every schema (and leftover extra) attribute on one electrode."""
+        keys = [spec.key for spec in self.attribute_schema]
+        seen = set(keys)
+        for key in model.extra:
+            if key not in seen:
+                keys.append(key)
+                seen.add(key)
+        texts: list[str] = []
+        for key in keys:
+            texts.append(str(model.get_attribute(key)).strip())
+        texts.append(f"{int(model.potentiostat_id):03d}")
+        return texts
+
+    def _find_by_attributes(self) -> None:
+        """
+        Select every electrode that has an attribute matching the find field, then scroll to them.
 
         Matching order: exact (after strip), then case-insensitive exact.
+        Built-in identifiers and file-defined extra attributes are all searched.
         """
-        query = self.contact_find_edit.text().strip()
+        query = self.attribute_find_edit.text().strip()
         if not query:
-            QMessageBox.information(self, "Find contact ID", "Enter a contact ID to search.")
+            QMessageBox.information(self, "Find attributes", "Enter a value to search in all attributes.")
             return
         if not self.items:
-            QMessageBox.information(self, "Find contact ID", "No electrodes in the current array.")
+            QMessageBox.information(self, "Find attributes", "No electrodes in the current array.")
             return
 
-        def norm(s: str) -> str:
-            return str(s).strip()
+        def matches_query(model: Electrode, *, ignore_case: bool) -> bool:
+            needle = query.lower() if ignore_case else query
+            for text in self._electrode_attribute_texts(model):
+                haystack = text.lower() if ignore_case else text
+                if haystack == needle:
+                    return True
+            return False
 
-        matches = [it for it in self.items.values() if norm(it.model.contact_id) == query]
+        matches = [it for it in self.items.values() if matches_query(it.model, ignore_case=False)]
         if not matches:
-            q_lower = query.lower()
-            matches = [it for it in self.items.values() if norm(it.model.contact_id).lower() == q_lower]
+            matches = [it for it in self.items.values() if matches_query(it.model, ignore_case=True)]
         if not matches:
             QMessageBox.information(
                 self,
-                "Contact ID not found",
-                f"No electrode has contact ID « {query} ».",
+                "Attribute not found",
+                f"No electrode has an attribute equal to « {query} ».",
             )
             return
 
@@ -358,128 +903,488 @@ class ElectrodeArrayEditorQt(QMainWindow):
             united = united.united(item.sceneBoundingRect())
         pad = 40.0
         united = united.adjusted(-pad, -pad, pad, pad)
-        self.view.ensureVisible(united, 80, 80)
+        self.electrode_view.ensureVisible(united, 80, 80)
+        self.point_tabs.setCurrentIndex(TAB_ELECTRODES)
         self._refresh_panel_values()
 
-    def _grid_axes(self) -> tuple[list[float], list[float]]:
-        """
-        Return sorted unique X/Y coordinates for grid and axes.
+    def _grid_axes(self, view=None) -> tuple[list[float], list[float]]:
+        """Return sorted unique X/Y coordinates for grid and axes of one mapping view."""
+        if view is self.pads_map_view and self.pads:
+            models = self.pads.values()
+        elif view is self.electrode_view and self.electrodes:
+            models = self.electrodes.values()
+        else:
+            models = list(self.electrodes.values()) + list(self.pads.values())
+        xs = {round(model.x, 6) for model in models}
+        ys = {round(model.y, 6) for model in models}
+        return sorted(xs), sorted(ys)
 
-        Returns:
-            (xs, ys): lists of electrode abscissas and ordinates.
-        """
-        # Round to avoid near-duplicate grid lines from float noise.
-        xs = sorted({round(model.x, 6) for model in self.electrodes.values()})
-        ys = sorted({round(model.y, 6) for model in self.electrodes.values()})
-        return xs, ys
-
-    def _electrode_bounds_rect(self, margin: float = 0.0) -> QRectF:
-        """
-        Compute bounding rect of all electrodes (center + radius).
-
-        Args:
-            margin: Optional margin added on each side.
-
-        Returns:
-            QRectF enclosing all circles, or default rect if empty.
-        """
-        if not self.electrodes:
-            return QRectF(-1.0, -1.0, 2.0, 2.0)  # Fallback for empty scene.
-        min_x = min(model.x - model.radius for model in self.electrodes.values())
-        max_x = max(model.x + model.radius for model in self.electrodes.values())
-        min_y = min(model.y - model.radius for model in self.electrodes.values())
-        max_y = max(model.y + model.radius for model in self.electrodes.values())
+    def _models_bounds_rect(self, models, margin: float = 0.0) -> QRectF:
+        """Bounding rect of contact models (center + half-extents)."""
+        extents: list[tuple[float, float, float, float]] = []
+        for m in models:
+            half_x, half_y = contact_half_extents(m.shape, m.radius, m.height)
+            extents.append((m.x, m.y, half_x, half_y))
+        if not extents:
+            return QRectF(-1.0, -1.0, 2.0, 2.0)
+        min_x = min(x - half_x for x, y, half_x, half_y in extents)
+        max_x = max(x + half_x for x, y, half_x, half_y in extents)
+        min_y = min(y - half_y for x, y, half_x, half_y in extents)
+        max_y = max(y + half_y for x, y, half_x, half_y in extents)
         rect = QRectF(min_x, min_y, max(max_x - min_x, 1.0), max(max_y - min_y, 1.0))
         if margin > 0:
             rect = rect.adjusted(-margin, -margin, margin, margin)
         return rect
 
-    def _capture_state(
+    def _array_bounds_rect(self, margin: float = 0.0) -> QRectF:
+        """Bounding rect of all electrodes and pads (center + half-extents)."""
+        return self._models_bounds_rect(
+            list(self.electrodes.values()) + list(self.pads.values()),
+            margin=margin,
+        )
+
+    def _electrode_bounds_rect(self, margin: float = 0.0) -> QRectF:
+        """Bounding rect of electrodes only."""
+        return self._models_bounds_rect(self.electrodes.values(), margin=margin)
+
+    def _pad_bounds_rect(self, margin: float = 0.0) -> QRectF:
+        """Bounding rect of pads only."""
+        return self._models_bounds_rect(self.pads.values(), margin=margin)
+
+    def _capture_state(self) -> EditorState:
+        """Capture full state snapshot for undo/redo."""
+        return EditorState(
+            electrodes={eid: m.snapshot() for eid, m in self.electrodes.items()},
+            pads={pad_id: m.snapshot() for pad_id, m in self.pads.items()},
+            attribute_schema=tuple(self.attribute_schema),
+            map_labels=tuple(sorted(self.visible_map_label_keys)),
+            si_units=self.si_units,
+            current_file_path=self.current_file_path,
+        )
+
+    def _mark_clean(self) -> None:
+        """Remember the last saved/loaded state for the dirty flag."""
+        self._clean_state = self._capture_state()
+        self.is_dirty = False
+        self._update_title()
+
+    def _refresh_dirty_flag(self) -> None:
+        """Set is_dirty from a comparison with the last clean snapshot."""
+        if self._clean_state is None:
+            self.is_dirty = True
+        else:
+            self.is_dirty = not self._states_equal(self._capture_state(), self._clean_state)
+        self._update_title()
+
+    def _set_array(
         self,
-    ) -> dict[int, tuple[float, float, float, bool, int, str, tuple[float, float, float, float], str, str]]:
+        models: list[Electrode],
+        pads: list[Pad] | None = None,
+        *,
+        keep_pads: bool = False,
+    ) -> None:
         """
-        Capture full state snapshot for undo/redo.
-
-        Returns:
-            Dict eid -> (x, y, radius, enabled, channel_index, contact_id,
-                         contact_plane_axis, shank_id, shape).
+        Replace entire scene content with the given electrode and pad lists.
         """
-        return {
-            eid: (
-                m.x,
-                m.y,
-                m.radius,
-                m.enabled,
-                m.channel_index,
-                m.contact_id,
-                m.contact_plane_axis,
-                m.shank_id,
-                m.shape,
+        if pads is None:
+            pads = list(self.pads.values()) if keep_pads else []
+        fill_electrodes_extras(models, self.attribute_schema, prune=False)
+        eid_fixes, pad_id_fixes = ensure_unique_model_ids(models, pads)
+        if (eid_fixes or pad_id_fixes) and not self._is_restoring_state:
+            parts: list[str] = []
+            if eid_fixes:
+                parts.append(f"{eid_fixes} duplicate electrode ID(s) were reassigned.")
+            if pad_id_fixes:
+                parts.append(f"{pad_id_fixes} duplicate pad ID(s) were reassigned.")
+            parts.append(
+                "Pads keep their stored electrode link: they stay on the electrode "
+                "that kept the original ID."
             )
-            for eid, m in self.electrodes.items()
-        }
-
-    def _set_electrodes(self, models: list[Electrode]) -> None:
-        """
-        Replace entire scene content with the given model list.
-
-        Clears scene, recreates items, updates electrodes/items,
-        sceneRect, duplicate flags, panel and title.
-        """
-        self.scene.clear()
-        self.electrodes.clear()
-        self.items.clear()
-        for model in models:
-            # on_change: refresh panel + overlays; on_selection: refresh panel.
-            item = ElectrodeView(model, self._on_scene_visuals_changed, self._refresh_panel_values)
-            self.scene.addItem(item)
-            self.electrodes[model.eid] = model
-            self.items[model.eid] = item
-        # Expand scene rect so user can pan/scroll in margins.
-        self.scene.setSceneRect(self._electrode_bounds_rect(margin=DEFAULT_SCENE_MARGIN))
+            QMessageBox.warning(self, "Duplicate identifiers", "\n".join(parts))
+        cameras = self._capture_map_cameras()
+        visible = QRectF()
+        for view in self._map_views():
+            vis = view.visible_scene_rect()
+            if vis.isValid() and not vis.isEmpty():
+                visible = vis if visible.isNull() else visible.united(vis)
+        self._auto_selected_electrode_eids.clear()
+        self._auto_selected_pad_ids.clear()
+        self._is_mutating_scene = True
+        try:
+            self.scene.clear()
+            self.electrodes.clear()
+            self.items.clear()
+            self.pads.clear()
+            self.pad_items.clear()
+            for model in models:
+                self._add_electrode_item(model)
+            for pad in pads:
+                self._add_pad_item(pad)
+            self._ensure_scene_rect(extra=visible if not visible.isNull() else None)
+            self._restore_map_cameras(cameras)
+        finally:
+            self._is_mutating_scene = False
         self._update_duplicate_flags()
+        self._refresh_pad_electrode_combo()
+        self._refresh_pad_add_electrode_combo()
         self._refresh_panel_values()
         self.si_units_edit.setText(self.si_units)
         self._update_title()
-        # Defer label layout so view has updated after scene change (add/delete).
+        self._sync_electrode_table(reload_data=True)
         QTimer.singleShot(0, self._refresh_label_layouts)
-    
-    def _set_add_mode(self, enabled: bool) -> None:
-        """
-        Toggle one-click electrode creation mode.
 
-        Change button text and cursor (cross when active).
-        """
+    def _add_electrode_item(self, model: Electrode) -> ElectrodeView:
+        """Add one electrode to the scene without rebuilding existing items."""
+        item = ElectrodeView(
+            model,
+            self._on_scene_visuals_changed,
+            self._refresh_panel_values,
+            self._labels_for_electrode,
+        )
+        self.scene.addItem(item)
+        self.electrodes[model.eid] = model
+        self.items[model.eid] = item
+        item._layout_labels()
+        return item
+
+    def _add_pad_item(self, pad: Pad) -> PadView:
+        """Add one pad and its link line without rebuilding existing items."""
+        item = PadView(
+            pad,
+            self._on_scene_visuals_changed,
+            self._refresh_panel_values,
+            self.electrodes.get,
+            self._labels_for_electrode,
+        )
+        self.scene.addItem(item)
+        self.scene.addItem(item.link_item)
+        self.pads[pad.pad_id] = pad
+        self.pad_items[pad.pad_id] = item
+        item.update_link()
+        item._layout_labels()
+        return item
+
+    def _set_electrodes(self, models: list[Electrode]) -> None:
+        """Replace scene electrodes while keeping current pads."""
+        self._set_array(models, keep_pads=True)
+
+    def _next_unique_intan_id(self) -> str:
+        """Return the first sequential INTAN ID not already used in the array."""
+        existing = {str(model.intan_id).strip() for model in self.electrodes.values()}
+        index = 0
+        while True:
+            candidate = format_intan_id(index)
+            if candidate not in existing:
+                return candidate
+            index += 1
+
+    def _next_unique_potentiostat_id(self) -> int:
+        """Return the lowest unused potentiostat ID."""
+        used = {model.potentiostat_id for model in self.electrodes.values()}
+        next_id = 0
+        while next_id in used:
+            next_id += 1
+        return next_id
+
+    def _electrode_combo_label(self, model: Electrode) -> str:
+        """Label used in the pad-to-electrode association combo (no pad/eid numbers)."""
+        name = model.map_center_label()
+        intan = str(model.intan_id).strip()
+        return f"{name} · {intan}" if intan else name
+
+    def _taken_electrode_eids(self, *, except_pad_ids: set[int] | None = None) -> set[int]:
+        """Electrodes that already have at least one pad (optionally ignoring some pads)."""
+        skip = except_pad_ids or set()
+        return {pad.electrode_eid for pad in self.pads.values() if pad.pad_id not in skip}
+
+    def _free_electrode_eids(self, *, extra: set[int] | None = None) -> list[int]:
+        """Electrodes that have no pad yet, plus any eids in `extra` (still in the array)."""
+        extra = extra or set()
+        taken = self._taken_electrode_eids()
+        return [
+            eid
+            for eid in sorted(self.electrodes)
+            if eid not in taken or eid in extra
+        ]
+
+    def _refresh_pad_electrode_combo(
+        self,
+        selected_eid: int | None = None,
+        mixed: bool = False,
+        keep_eids: set[int] | None = None,
+    ) -> None:
+        """Rebuild the associated-electrode combo: none, free electrodes, current link(s)."""
+        combo = self.pad_electrode_combo
+        combo.blockSignals(True)
+        combo.clear()
+        if mixed:
+            combo.addItem("(mixed)", None)
+        combo.addItem("(none)", -1)
+        keep = set(keep_eids or ())
+        if selected_eid is not None and selected_eid in self.electrodes:
+            keep.add(selected_eid)
+        for eid in self._free_electrode_eids(extra=keep):
+            combo.addItem(self._electrode_combo_label(self.electrodes[eid]), eid)
+        if mixed:
+            combo.setCurrentIndex(0)
+        elif selected_eid is not None and selected_eid in self.electrodes:
+            idx = combo.findData(selected_eid)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        else:
+            combo.setCurrentIndex(combo.findData(-1))
+        combo.blockSignals(False)
+
+    def _refresh_pad_add_electrode_combo(self) -> None:
+        """Rebuild the Add Pad list with electrodes that do not already have a pad."""
+        combo = self.pad_add_electrode_combo
+        current = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for eid in self._free_electrode_eids():
+            combo.addItem(self._electrode_combo_label(self.electrodes[eid]), eid)
+        if current is not None:
+            idx = combo.findData(current)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+
+    @staticmethod
+    def _set_height_row_visible(form: QFormLayout, label: QLabel, edit: QLineEdit, visible: bool) -> None:
+        """Show or hide a Height row in a geometry form."""
+        label.setVisible(visible)
+        edit.setVisible(visible)
+        form.setRowVisible(edit, visible)
+
+    @staticmethod
+    def _convert_size_edit(edit: QLineEdit, old_shape: str, new_shape: str) -> float | None:
+        """Rewrite a size field so the stored half-extent stays the same. Return that half-extent."""
+        text = edit.text().strip()
+        if not text:
+            return None
+        try:
+            stored = stored_half_from_size_field(old_shape, float(text))
+            edit.setText(f"{size_field_from_stored_half(new_shape, stored):.2f}")
+            return stored
+        except ValueError:
+            return None
+
+    def _on_electrode_shape_combo_changed(self, shape: str) -> None:
+        """Rename size fields and convert values so the drawn electrode keeps its extent."""
+        if shape == MIXED_SHAPE_LABEL:
+            return
+        shape = normalize_contact_shape(shape, DEFAULT_SHAPE)
+        if self._electrode_size_shape != MIXED_SHAPE_LABEL:
+            stored = self._convert_size_edit(self.radius_edit, self._electrode_size_shape, shape)
+        else:
+            stored = None
+        if shape_uses_height(shape):
+            if stored is not None:
+                self.height_edit.setText(f"{size_field_from_stored_half('rect', stored):.2f}")
+            elif not self.height_edit.text().strip():
+                self.height_edit.setText(self.radius_edit.text())
+        self._set_electrode_size_label(shape)
+        self._set_height_row_visible(
+            self._electrode_geom_form,
+            self.electrode_height_label,
+            self.height_edit,
+            shape_uses_height(shape),
+        )
+
+    def _set_electrode_size_label(self, shape: str) -> None:
+        """Update the electrode size field caption without converting the current text."""
+        if shape == MIXED_SHAPE_LABEL:
+            return
+        shape = normalize_contact_shape(shape, DEFAULT_SHAPE)
+        self._electrode_size_shape = shape
+        self.electrode_size_label.setText(primary_size_field_label(shape))
+
+    def _on_pad_shape_combo_changed(self, shape: str) -> None:
+        """Rename the size field and convert its value so the drawn pad keeps its extent."""
+        if shape == MIXED_SHAPE_LABEL:
+            return
+        shape = normalize_contact_shape(shape, DEFAULT_PAD_SHAPE)
+        if self._pad_size_shape != MIXED_SHAPE_LABEL:
+            stored = self._convert_size_edit(self.pad_radius_edit, self._pad_size_shape, shape)
+        else:
+            stored = None
+        if shape_uses_height(shape):
+            if stored is not None:
+                self.pad_height_edit.setText(f"{size_field_from_stored_half('rect', stored):.2f}")
+            elif not self.pad_height_edit.text().strip():
+                self.pad_height_edit.setText(self.pad_radius_edit.text())
+        self._set_pad_size_label(shape)
+        self._set_height_row_visible(
+            self._pad_form,
+            self.pad_height_label,
+            self.pad_height_edit,
+            shape_uses_height(shape),
+        )
+
+    def _set_pad_size_label(self, shape: str) -> None:
+        """Update the pad size field caption without converting the current text."""
+        if shape == MIXED_SHAPE_LABEL:
+            return
+        shape = normalize_contact_shape(shape, DEFAULT_PAD_SHAPE)
+        self._pad_size_shape = shape
+        self.pad_size_label.setText(primary_size_field_label(shape))
+
+    @staticmethod
+    def _set_shape_combo(combo: QComboBox, shapes: tuple[str, ...], value: str, mixed: bool) -> None:
+        """Show a real shape, or a mixed placeholder that Confirm will leave unchanged."""
+        combo.blockSignals(True)
+        if combo.findText(MIXED_SHAPE_LABEL) >= 0:
+            combo.removeItem(combo.findText(MIXED_SHAPE_LABEL))
+        if mixed:
+            combo.insertItem(0, MIXED_SHAPE_LABEL)
+            combo.setCurrentIndex(0)
+        else:
+            if value in shapes:
+                combo.setCurrentText(value)
+            else:
+                combo.setCurrentIndex(0)
+        combo.blockSignals(False)
+
+    def _new_pad_electrode_eid(self) -> int | None:
+        """Electrode chosen in the Add Pad list, if it still exists."""
+        eid = self.pad_add_electrode_combo.currentData()
+        if eid is None or eid not in self.electrodes:
+            return None
+        return int(eid)
+
+    def _set_add_mode(self, enabled: bool) -> None:
+        """Toggle one-click electrode creation mode."""
         self.is_add_mode = enabled
         if enabled:
+            if self.b_add_pad.isChecked():
+                self.b_add_pad.setChecked(False)
             self.b_add_electrode.setText("Stop Adding")
-            self.view.viewport().setCursor(Qt.CrossCursor)
+            self._sync_add_cursors()
         else:
             self.b_add_electrode.setText("Add Electrode")
-            self.view.viewport().unsetCursor()
+            self._sync_add_cursors()
+
+    def _set_add_pad_mode(self, enabled: bool) -> None:
+        """Toggle one-click pad creation mode (electrode chosen from the list)."""
+        if enabled:
+            if not self.electrodes:
+                QMessageBox.information(
+                    self,
+                    "Add Pad",
+                    "No electrodes in the array. Create an electrode first.",
+                )
+                self.b_add_pad.blockSignals(True)
+                self.b_add_pad.setChecked(False)
+                self.b_add_pad.blockSignals(False)
+                self.is_add_pad_mode = False
+                return
+            self._refresh_pad_add_electrode_combo()
+            if self._new_pad_electrode_eid() is None:
+                QMessageBox.information(
+                    self,
+                    "Add Pad",
+                    "Every electrode already has a pad. Each electrode can be linked to only one pad.",
+                )
+                self.b_add_pad.blockSignals(True)
+                self.b_add_pad.setChecked(False)
+                self.b_add_pad.blockSignals(False)
+                self.is_add_pad_mode = False
+                return
+            if self.b_add_electrode.isChecked():
+                self.b_add_electrode.setChecked(False)
+            self.is_add_pad_mode = True
+            self.b_add_pad.setText("Stop Adding")
+            self._sync_add_cursors()
+        else:
+            self.is_add_pad_mode = False
+            self.b_add_pad.setText("Add Pad")
+            self._sync_add_cursors()
+
+    def _sync_add_cursors(self) -> None:
+        """Show a crosshair on both mapping views while add-mode is active."""
+        adding = self.is_add_mode or self.is_add_pad_mode
+        for view in (self.electrode_view, self.pads_map_view):
+            if adding:
+                view.viewport().setCursor(Qt.CrossCursor)
+            else:
+                view.viewport().unsetCursor()
+
+    def _add_point_at(self, x: float, y: float) -> None:
+        """Dispatch scene click to electrode or pad creation."""
+        if self.is_add_pad_mode:
+            self._add_pad_at(x, y)
+        else:
+            self._add_electrode_at(x, y)
 
     def _add_electrode_at(self, x: float, y: float) -> None:
-        """
-        Create a new electrode at (x, y) and select it.
-
-        Uses next available eid, default contact_id "A-000".
-        """
+        """Create a new electrode at (x, y) with a unique paired pad, and select it."""
         before = self._capture_state()
-        next_eid = max(self.electrodes.keys(), default=-1) + 1  # Unique id.
-        model = Electrode(eid=next_eid, x=x, y=y, channel_index=next_eid, contact_id="A-000")
-        models = list(self.electrodes.values()) + [model]
-        self._set_electrodes(models)
+        next_eid = max(self.electrodes.keys(), default=-1) + 1
+        next_pad_id = max(self.pads.keys(), default=-1) + 1
+        model = Electrode(
+            eid=next_eid,
+            x=x,
+            y=y,
+            potentiostat_id=self._next_unique_potentiostat_id(),
+            intan_id=self._next_unique_intan_id(),
+        )
+        fill_electrode_extras(model, self.attribute_schema)
+        offset = max(model.radius, DEFAULT_PAD_RADIUS) * 3.0 + 20.0
+        pad = Pad(pad_id=next_pad_id, electrode_eid=next_eid, x=x + offset, y=y)
+        self._is_mutating_scene = True
+        try:
+            item = self._add_electrode_item(model)
+            self._add_pad_item(pad)
+        finally:
+            self._is_mutating_scene = False
+        self._update_duplicate_flags()
+        self._refresh_pad_electrode_combo()
+        self._refresh_pad_add_electrode_combo()
         self.scene.clearSelection()
-        if next_eid in self.items:
-            self.items[next_eid].setSelected(True)
+        item.setSelected(True)
+        self._on_scene_visuals_changed()
+        self._commit_if_changed(before)
+
+    def _add_pad_at(self, x: float, y: float) -> None:
+        """Create a new pad at (x, y) linked to a free electrode chosen in the list."""
+        target_eid = self._new_pad_electrode_eid()
+        if target_eid is None:
+            QMessageBox.information(
+                self,
+                "Add Pad",
+                "Every electrode already has a pad. Each electrode can be linked to only one pad.",
+            )
+            self.b_add_pad.setChecked(False)
+            return
+        if target_eid in self._taken_electrode_eids():
+            QMessageBox.information(
+                self,
+                "Add Pad",
+                "That electrode already has a pad. Choose an electrode without a pad.",
+            )
+            self._refresh_pad_add_electrode_combo()
+            if self._new_pad_electrode_eid() is None:
+                self.b_add_pad.setChecked(False)
+            return
+        before = self._capture_state()
+        next_pad_id = max(self.pads.keys(), default=-1) + 1
+        pad = Pad(pad_id=next_pad_id, electrode_eid=target_eid, x=x, y=y)
+        self._is_mutating_scene = True
+        try:
+            item = self._add_pad_item(pad)
+        finally:
+            self._is_mutating_scene = False
+        self._update_duplicate_flags()
+        self._refresh_pad_electrode_combo()
+        self._refresh_pad_add_electrode_combo()
+        self.scene.clearSelection()
+        item.setSelected(True)
+        if self._new_pad_electrode_eid() is None and self.is_add_pad_mode:
+            self.b_add_pad.setChecked(False)
+        self._on_scene_visuals_changed()
         self._commit_if_changed(before)
 
     def _apply_si_units(self) -> None:
-        """
-        Apply distance unit (si_units) at array level.
-
-        Reads from panel field, validates, updates and marks dirty.
-        """
+        """Apply distance unit (si_units) at array level."""
         units = self.si_units_edit.text().strip()
         if not units:
             QMessageBox.information(self, "No values", "Fill si_units before applying.")
@@ -487,31 +1392,25 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return
         if units == self.si_units:
             return
+        before = self._capture_state()
         self.si_units = units
         self.si_units_edit.setText(self.si_units)
-        self.is_dirty = True
-        self._update_title()
+        self._commit_if_changed(before)
 
     def _update_title(self) -> None:
-        """
-        Update window title with file path and asterisk if modified.
-        """
+        """Update window title with version, file path, and asterisk if modified."""
         dirty_suffix = " *" if self.is_dirty else ""
+        versioned_name = f"{APP_NAME} v{__version__}"
         if self.current_file_path:
-            self.setWindowTitle(f"Electrode Array Editor (Qt Standalone) - {self.current_file_path}{dirty_suffix}")
+            self.setWindowTitle(f"{versioned_name} - {self.current_file_path}{dirty_suffix}")
         else:
-            self.setWindowTitle(f"Electrode Array Editor (Qt Standalone){dirty_suffix}")
+            self.setWindowTitle(f"{versioned_name}{dirty_suffix}")
 
     def _startup_workflow(self) -> None:
-        """
-        On startup, show dialog: open or create array.
-
-        If user cancels or fails to open/create, close application.
-        Called after main window is shown so it appears as a proper window.
-        """
+        """On startup, show dialog: open or create array."""
         self._start_dependency_preload()
         msg = QMessageBox(self)
-        msg.setWindowTitle("Electrode Array Editor")
+        msg.setWindowTitle(APP_NAME)
         msg.setText("Choose how to start:")
         open_btn = msg.addButton("Open existing array", QMessageBox.AcceptRole)
         new_btn = msg.addButton("Create new array", QMessageBox.ActionRole)
@@ -530,34 +1429,35 @@ class ElectrodeArrayEditorQt(QMainWindow):
             self.close()
 
     def _prompt_new_array_parameters(self) -> bool:
-        """
-        Open new-matrix dialog and generate grid if accepted.
-
-        Returns:
-            True if grid was created, False if cancelled.
-        """
+        """Open new-matrix dialog and generate grid if accepted."""
         self._start_dependency_preload()
         dialog = NewArrayDialog(self)
         if dialog.exec() != QDialog.Accepted:
             return False
-        rows, cols, pitch, units = dialog.values()
-        self.si_units = units
-        self._generate_aligned_grid(rows, cols, pitch)
+        params = dialog.values()
+        n_contacts = params.rows * params.cols
+        if n_contacts > NEW_ARRAY_WARN_COUNT:
+            confirm = QMessageBox.question(
+                self,
+                "Large array",
+                f"This will create {n_contacts} electrodes and {n_contacts} pads. "
+                "The editor may become slow. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return False
+        self.si_units = params.si_units
+        self._generate_aligned_grid(params)
         self.current_file_path = None
-        self.is_dirty = True
-        self._update_title()
-        self._fit_view()
+        self._refresh_dirty_flag()
+        self._fit_all_views()
         self.raise_()
         self.activateWindow()
         return True
 
     def _prompt_open_array_file(self) -> bool:
-        """
-        Prompt for JSON path via dialog and load array.
-
-        Returns:
-            True if loaded successfully, False if cancelled or error.
-        """
+        """Prompt for JSON path via dialog and load array."""
         self._start_dependency_preload()
         path, _ = QFileDialog.getOpenFileName(
             self,
@@ -573,31 +1473,23 @@ class ElectrodeArrayEditorQt(QMainWindow):
             QMessageBox.critical(self, "Load error", f"Could not load file:\n{exc}")
             return False
         self.current_file_path = path
-        self.is_dirty = False
-        self._update_title()
-        self._fit_view()
+        self._mark_clean()
+        self._fit_all_views()
         self.raise_()
         self.activateWindow()
         return True
 
     def _start_dependency_preload(self) -> None:
-        """
-        Preload optional heavy dependencies in background.
-
-        This runs while the user is choosing a file or defining a matrix, so
-        later file I/O actions are less likely to pause on first import.
-        """
+        """Preload optional heavy dependencies in background (XLSX export)."""
         if self._preload_started:
             return
         self._preload_started = True
 
         def _preload() -> None:
-            for module_name in ("probeinterface", "pandas", "openpyxl"):
+            for module_name in ("openpyxl",):
                 try:
                     importlib.import_module(module_name)
                 except Exception:
-                    # Keep startup non-blocking; missing modules are handled
-                    # later with explicit user-facing error messages.
                     pass
 
         self._preload_thread = threading.Thread(target=_preload, daemon=True, name="dependency-preload")
@@ -616,10 +1508,83 @@ class ElectrodeArrayEditorQt(QMainWindow):
         """Menu handler for Save As."""
         self._save_current_array_as(show_success=True)
 
+    def _menu_export_spikeinterface(self) -> None:
+        """Menu handler for SpikeInterface / probeinterface JSON export."""
+        if not self.electrodes:
+            QMessageBox.information(self, "Export SpikeInterface", "No array to export.")
+            return
+        if not self._confirm_pairing_before_export():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export SpikeInterface JSON",
+            "",
+            "JSON files (*.json);;All files (*.*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        try:
+            export_spikeinterface_json(
+                path,
+                list(self.electrodes.values()),
+                self.si_units,
+                pads=list(self.pads.values()),
+                electrode_attributes=self.attribute_schema,
+                map_labels=self.visible_map_label_keys,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export SpikeInterface", f"Could not export JSON:\n{exc}")
+            return
+        QMessageBox.information(
+            self,
+            "Export SpikeInterface",
+            "Probeinterface JSON exported for SpikeInterface.\n"
+            "Channel ID comes from INTAN ID; Contact ID comes from Manufacturer ID "
+            "(or INTAN ID if Manufacturer ID is unused).\n"
+            "Native IDs, extra attributes, and the linked pad (id + geometry) "
+            "are stored in contact_annotations.\n"
+            "The attribute schema and map labels are kept in probe annotations.",
+        )
+
+    def _menu_export_analysis(self) -> None:
+        """Menu handler for analysis XLSX export (channel, row, col)."""
+        if not self.electrodes:
+            QMessageBox.information(self, "Export for analysis", "No array to export.")
+            return
+        if not self._confirm_pairing_before_export():
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export for analysis",
+            "",
+            "Excel files (*.xlsx);;All files (*.*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
+        try:
+            self._export_analysis_to_xlsx(path)
+        except ImportError as exc:
+            QMessageBox.critical(
+                self,
+                "Export for analysis",
+                f"Could not export XLSX:\n{exc}\n\nInstall with: pip install openpyxl",
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "Export for analysis", f"Could not export XLSX:\n{exc}")
+            return
+        QMessageBox.information(self, "Export for analysis", "Analysis table exported successfully.")
+
     def _menu_export_matrix_xlsx(self) -> None:
         """Menu handler for array export as XLSX."""
         if not self.electrodes:
             QMessageBox.information(self, "Export XLSX", "No array to export.")
+            return
+        if not self._confirm_pairing_before_export():
             return
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -643,43 +1608,70 @@ class ElectrodeArrayEditorQt(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Export XLSX", f"Could not export XLSX:\n{exc}")
             return
-        QMessageBox.information(self, "Export XLSX", "Matrix exported successfully.")
+        QMessageBox.information(
+            self,
+            "Export XLSX",
+            "Workbook exported successfully (electrodes, pads, and attribute schema).",
+        )
+
+    def _confirm_pairing(self, title: str, question: str) -> bool:
+        """Warn when the 1:1 electrode/pad pairing is incomplete."""
+        problems = pairing_problems(self.electrodes.values(), self.pads.values())
+        if not problems:
+            return True
+        confirm = QMessageBox.question(
+            self,
+            title,
+            "The array has pairing issues:\n- "
+            + "\n- ".join(problems)
+            + f"\n\n{question}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return confirm == QMessageBox.Yes
+
+    def _confirm_pairing_before_save(self) -> bool:
+        """Warn when the 1:1 electrode/pad pairing is incomplete."""
+        return self._confirm_pairing("Pairing issues", "Save anyway?")
+
+    def _confirm_pairing_before_export(self) -> bool:
+        """Warn when exporting an array that is not 1:1 paired."""
+        return self._confirm_pairing("Pairing issues", "Export anyway?")
 
     def _save_current_array(self, show_success: bool = False) -> bool:
-        """
-        Save to current path. If no path, open Save As dialog.
-
-        Args:
-            show_success: Show success message after save.
-
-        Returns:
-            True if saved, False otherwise.
-        """
+        """Save to current path. If no path, open Save As dialog."""
         if not self.electrodes:
             QMessageBox.information(self, "Save array", "No array to save.")
             return False
         if not self.current_file_path:
             return self._save_current_array_as(show_success=show_success)
+        if is_probeinterface_file(self.current_file_path):
+            QMessageBox.information(
+                self,
+                "Save array",
+                "The opened file is a probeinterface JSON.\n"
+                "Native save uses the mea_editor format. Choose a new path.\n"
+                "Use File > Export for SpikeInterface... to write a probeinterface JSON.",
+            )
+            return self._save_current_array_as(show_success=show_success)
+        if not self._confirm_pairing_before_save():
+            return False
         try:
             self._save_array_to_file(self.current_file_path)
         except Exception as exc:
             QMessageBox.critical(self, "Save error", f"Could not save file:\n{exc}")
             return False
-        self.is_dirty = False
-        self._update_title()
+        self._mark_clean()
         if show_success:
             QMessageBox.information(self, "Save array", "Array saved successfully.")
         return True
 
     def _save_current_array_as(self, show_success: bool = False) -> bool:
-        """
-        Save with explicit file selection dialog.
-
-        Returns:
-            True if saved, False if cancelled or error.
-        """
+        """Save with explicit file selection dialog."""
         if not self.electrodes:
             QMessageBox.information(self, "Save array", "No array to save.")
+            return False
+        if not self._confirm_pairing_before_save():
             return False
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -689,26 +1681,33 @@ class ElectrodeArrayEditorQt(QMainWindow):
         )
         if not path:
             return False
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        if is_probeinterface_file(path):
+            confirm = QMessageBox.question(
+                self,
+                "Replace probeinterface file",
+                "This file is a probeinterface JSON. Saving will replace it with the native mea_editor format.\n"
+                "Use File > Export for SpikeInterface... if you want a probeinterface JSON.\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return False
         try:
             self._save_array_to_file(path)
         except Exception as exc:
             QMessageBox.critical(self, "Save error", f"Could not save file:\n{exc}")
             return False
         self.current_file_path = path
-        self.is_dirty = False
-        self._update_title()
+        self._mark_clean()
         if show_success:
             QMessageBox.information(self, "Save array", "Array saved successfully.")
         return True
 
     def _confirm_before_replace(self, action_label: str) -> bool:
-        """
-        Prompt save/discard/cancel before replacing content.
-
-        Returns:
-            True if user confirmed; False to abort.
-        """
-        if self.electrodes and self.is_dirty:
+        """Prompt save/discard/cancel before replacing content."""
+        if self.is_dirty:
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Warning)
             msg.setWindowTitle("Unsaved changes")
@@ -729,7 +1728,6 @@ class ElectrodeArrayEditorQt(QMainWindow):
             else:
                 return False
 
-        # If array not empty, ask for replacement confirmation.
         if self.electrodes:
             confirm = QMessageBox.question(
                 self,
@@ -743,388 +1741,307 @@ class ElectrodeArrayEditorQt(QMainWindow):
         return True
 
     def _save_array_to_file(self, path: str) -> None:
-        """
-        Persist current models via electrode_array_editor_io (probeinterface format).
-        """
-        save_electrodes_to_file(path, list(self.electrodes.values()), self.si_units)
+        """Persist current models in native mea_editor JSON format."""
+        save_array_to_file(
+            path,
+            list(self.electrodes.values()),
+            self.si_units,
+            pads=list(self.pads.values()),
+            electrode_attributes=self.attribute_schema,
+            map_labels=self.visible_map_label_keys,
+        )
 
     def _load_array_from_file(self, path: str) -> None:
+        """Load models from file and update si_units in memory."""
+        document = load_array_document(path)
+        self.si_units = document.si_units
+        self.visible_map_label_keys = set(document.map_labels)
+        self._set_attribute_schema(document.electrode_attributes, prune=False)
+        self._set_array(document.electrodes, document.pads)
+
+    def _export_analysis_to_xlsx(self, path: str) -> None:
         """
-        Load models from file and update si_units in memory.
+        Export the analysis table: channel, row, col, shape, identifiers, extras, pads.
         """
-        models, units = load_electrodes_from_file(path)
-        self.si_units = units
-        self._set_electrodes(models)
+        export_analysis_xlsx(
+            path,
+            list(self.electrodes.values()),
+            pads=list(self.pads.values()),
+            electrode_attributes=self.attribute_schema,
+        )
 
     def _export_matrix_to_xlsx(self, path: str) -> None:
-        """
-        Export array data into an XLSX file.
-
-        Output columns:
-        - channel
-        - row (electrode y)
-        - col (electrode x)
-        """
-        try:
-            from openpyxl import Workbook
-        except ImportError as exc:
-            raise ImportError("openpyxl is required for XLSX export.") from exc
-
-        workbook = Workbook()
-        worksheet = workbook.active
-        worksheet.title = "array"
-        worksheet.append(["channel", "row", "col"])
-        for model in sorted(self.electrodes.values(), key=lambda m: (m.channel_index, m.eid)):
-            worksheet.append([model.channel_index, model.y, model.x])
-        workbook.save(path)
-
-    def _update_duplicate_flags(self) -> tuple[list[int], list[str], int]:
-        """
-        Recompute duplicate flags (channel_index, contact_id) and refresh colors.
-
-        Returns:
-            (duplicate_channels, duplicate_contacts, empty_contact_count).
-        """
-        # Count (shank_id, channel_index) so same channel on different shanks
-        # is allowed and does not trigger duplicate highlighting.
-        channel_key_counts = Counter(
-            (str(model.shank_id).strip(), model.channel_index) for model in self.electrodes.values()
+        """Export electrodes, pads, and the attribute schema into an XLSX workbook."""
+        export_array_xlsx(
+            path,
+            list(self.electrodes.values()),
+            pads=list(self.pads.values()),
+            electrode_attributes=self.attribute_schema,
+            si_units=self.si_units,
         )
-        contact_counts = Counter(model.contact_id for model in self.electrodes.values())
-        duplicate_channel_keys = {key for key, count in channel_key_counts.items() if count > 1}
-        duplicate_channels = sorted({channel for _, channel in duplicate_channel_keys})
-        # Ignore empty contact_id in duplicate highlighting.
-        duplicate_contacts = sorted(v for v, c in contact_counts.items() if c > 1 and v.strip() != "")
-        empty_contact_count = contact_counts.get("", 0)
-        dup_contact_set = set(duplicate_contacts)
-        # Mark each model according to whether it is a duplicate.
-        for model in self.electrodes.values():
-            model_key = (str(model.shank_id).strip(), model.channel_index)
-            model.has_channel_duplicate = model_key in duplicate_channel_keys
-            model.has_contact_duplicate = model.contact_id in dup_contact_set
+
+    def _update_duplicate_flags(self) -> None:
+        """Recompute identifier and pairing flags, then refresh colors."""
+        refresh_status_flags(self.electrodes.values(), self.pads.values(), self.attribute_schema)
         for item in self.items.values():
             item._refresh_style()
-        return duplicate_channels, duplicate_contacts, empty_contact_count
+        for item in self.pad_items.values():
+            item._refresh_style()
+            item._refresh_label()
+            item.update_link()
 
-    def _states_equal(self, a, b) -> bool:
-        """
-        Compare two snapshots with tolerance on floats.
-
-        Args:
-            a, b: Dicts eid -> state tuple.
-
-        Returns:
-            True if states equivalent (same keys, close values).
-        """
-        if a.keys() != b.keys():
+    def _states_equal(self, a: EditorState, b: EditorState) -> bool:
+        """Compare two snapshots with tolerance on floats."""
+        if a.attribute_schema != b.attribute_schema:
+            return False
+        if a.map_labels != b.map_labels:
+            return False
+        if a.si_units != b.si_units or a.current_file_path != b.current_file_path:
+            return False
+        if a.electrodes.keys() != b.electrodes.keys() or a.pads.keys() != b.pads.keys():
             return False
         tol = 1e-9
-        for eid in a:
-            # Compare each field; tolerance on x, y, radius, contact_plane_axis.
-            ax, ay, ar, ae, ac, aid, aplane, ashank, ashape = a[eid]
-            bx, by, br, be, bc, bid, bplane, bshank, bshape = b[eid]
-            if ae != be or ac != bc or aid != bid or ashank != bshank or ashape != bshape:
+        for eid in a.electrodes:
+            left = a.electrodes[eid]
+            right = b.electrodes[eid]
+            if (
+                left.potentiostat_id != right.potentiostat_id
+                or left.intan_id != right.intan_id
+                or left.manufacturer_id != right.manufacturer_id
+                or left.shank_id != right.shank_id
+                or left.shape != right.shape
+                or left.extra != right.extra
+            ):
                 return False
-            if any(abs(av - bv) > tol for av, bv in zip(aplane, bplane)):
+            if any(abs(av - bv) > tol for av, bv in zip(left.contact_plane_axis, right.contact_plane_axis)):
                 return False
-            if abs(ax - bx) > tol or abs(ay - by) > tol or abs(ar - br) > tol:
+            if abs(left.x - right.x) > tol or abs(left.y - right.y) > tol or abs(left.radius - right.radius) > tol:
+                return False
+            if abs(left.height - right.height) > tol:
+                return False
+        for pad_id in a.pads:
+            left = a.pads[pad_id]
+            right = b.pads[pad_id]
+            if left.electrode_eid != right.electrode_eid or left.shape != right.shape:
+                return False
+            if abs(left.x - right.x) > tol or abs(left.y - right.y) > tol or abs(left.radius - right.radius) > tol:
+                return False
+            if abs(left.height - right.height) > tol:
                 return False
         return True
 
-    def _restore_state(self, state) -> None:
-        """
-        Restore snapshot into scene (undo/redo).
-
-        Recreates Electrode models from state, calls _set_electrodes,
-        then refreshes visuals.
-        """
+    def _restore_state(self, state: EditorState) -> None:
+        """Restore snapshot into scene (undo/redo)."""
         self._is_restoring_state = True
         try:
-            models: list[Electrode] = []
-            for eid, values in sorted(state.items(), key=lambda kv: kv[0]):
-                x, y, radius, enabled, channel_index, contact_id, contact_plane_axis, shank_id, shape = values
-                models.append(
-                    Electrode(
-                        eid=eid,
-                        x=x,
-                        y=y,
-                        radius=radius,
-                        enabled=enabled,
-                        channel_index=channel_index,
-                        contact_id=contact_id,
-                        contact_plane_axis=contact_plane_axis,
-                        shank_id=shank_id,
-                        shape=shape,
-                    )
-                )
-            self._set_electrodes(models)
+            self.si_units = state.si_units
+            self.current_file_path = state.current_file_path
+            self.visible_map_label_keys = set(state.map_labels)
+            self._set_attribute_schema(list(state.attribute_schema), prune=True)
+            models = [
+                Electrode.from_snapshot(eid, snap)
+                for eid, snap in sorted(state.electrodes.items(), key=lambda kv: kv[0])
+            ]
+            pads = [
+                Pad.from_snapshot(pad_id, snap)
+                for pad_id, snap in sorted(state.pads.items(), key=lambda kv: kv[0])
+            ]
+            self._set_array(models, pads)
         finally:
             self._is_restoring_state = False
         self._on_scene_visuals_changed()
 
-    def _push_undo(self, before_state) -> None:
-        """
-        Push state onto undo stack and clear redo stack.
-
-        Limits history size to _max_history.
-        """
+    def _push_undo(self, before_state: EditorState) -> None:
+        """Push state onto undo stack and clear redo stack."""
         self.undo_stack.append(before_state)
         if len(self.undo_stack) > self._max_history:
             self.undo_stack.pop(0)
         self.redo_stack.clear()
 
-    def _commit_if_changed(self, before_state) -> None:
-        """
-        Record undo entry only when state actually changed.
-
-        Compares before_state with current; if different, push undo and mark dirty.
-        """
+    def _commit_if_changed(self, before_state: EditorState) -> None:
+        """Record undo entry only when state actually changed."""
         after_state = self._capture_state()
         if not self._states_equal(before_state, after_state):
             self._push_undo(before_state)
-            self.is_dirty = True
-            self._update_title()
-
-    def _on_interaction_begin(self) -> None:
-        """
-        Store snapshot of state before interaction (mouse press).
-        """
-        self._interaction_snapshot = self._capture_state()
-
-    def _on_interaction_end(self) -> None:
-        """
-        Finalize interaction on mouse release: commit undo if changed.
-        """
-        if self._interaction_snapshot is None:
-            return
-        self._commit_if_changed(self._interaction_snapshot)
-        self._interaction_snapshot = None
-        # Refresh panel and scene rect after drag (skipped during drag to avoid crash).
-        self._on_scene_visuals_changed()
+            self._refresh_dirty_flag()
 
     def _on_scene_visuals_changed(self) -> None:
-        """
-        Refresh panel and overlays when geometry/selection changes.
-
-        Ignored during _is_restoring_state to avoid undo/redo recursion.
-        Skipped during drag (_interaction_snapshot set) to avoid crash when
-        moving many electrodes: ItemPositionHasChanged fires for each item,
-        causing excessive setSceneRect/invalidate calls.
-        """
-        if self._is_restoring_state:
-            return  # Avoid recursion during undo/redo restore.
-        if self._interaction_snapshot is not None:
-            return  # Skip during drag; _on_interaction_end will refresh.
+        """Refresh panel and overlays when geometry/selection changes."""
+        if self._is_restoring_state or self._is_mutating_scene:
+            return
         self._refresh_panel_values()
-        self.scene.setSceneRect(self._electrode_bounds_rect(margin=DEFAULT_SCENE_MARGIN))
+        self._ensure_scene_rect()
+        for item in self.pad_items.values():
+            item.update_link()
+        self._sync_electrode_table(reload_data=True)
         self.scene.invalidate(
             self.scene.sceneRect(),
             QGraphicsScene.BackgroundLayer | QGraphicsScene.ForegroundLayer,
         )
-        self.view.viewport().update()
+        self.electrode_view.viewport().update()
+        self.pads_map_view.viewport().update()
 
-    def keyPressEvent(self, event) -> None:  # type: ignore[override]
-        """
-        Handle global shortcuts: Ctrl+Z (undo), Ctrl+Y (redo).
-        Suppr/Backspace for delete is handled by ElectrodeArrayView when it has focus.
-        """
-        if event.matches(QKeySequence.Undo):
-            self._undo()
-            event.accept()
-            return
-        if event.matches(QKeySequence.Redo):
-            self._redo()
-            event.accept()
-            return
-        super().keyPressEvent(event)
+    def _undo_line_edit_if_focused(self) -> bool:
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QLineEdit):
+            focus.undo()
+            return True
+        return False
+
+    def _redo_line_edit_if_focused(self) -> bool:
+        focus = QApplication.focusWidget()
+        if isinstance(focus, QLineEdit):
+            focus.redo()
+            return True
+        return False
 
     def _undo(self) -> None:
-        """
-        Undo: restore previous state and put current into redo.
-        """
+        """Undo: restore previous state and put current into redo."""
+        if self._undo_line_edit_if_focused():
+            return
         if not self.undo_stack:
             return
         current = self._capture_state()
         previous = self.undo_stack.pop()
         self.redo_stack.append(current)
         self._restore_state(previous)
+        self._refresh_dirty_flag()
 
     def _redo(self) -> None:
-        """
-        Redo: restore next state and put current back into undo.
-        """
+        """Redo: restore next state and put current back into undo."""
+        if self._redo_line_edit_if_focused():
+            return
         if not self.redo_stack:
             return
         current = self._capture_state()
         nxt = self.redo_stack.pop()
         self.undo_stack.append(current)
         self._restore_state(nxt)
+        self._refresh_dirty_flag()
 
-    def _generate_aligned_grid(self, rows: int, cols: int, pitch: float) -> None:
-        """
-        Create regular rows x cols grid with pitch spacing.
-
-        Electrodes at (r*pitch, c*pitch), eid = 0..rows*cols-1.
-        """
+    def _generate_aligned_grid(self, params: NewArrayParams) -> None:
+        """Create an electrode grid and a matching pad rectangle around it."""
+        self.visible_map_label_keys = set(DEFAULT_MAP_LABEL_KEYS)
+        self._set_attribute_schema(default_schema(), prune=True)
         models: list[Electrode] = []
         eid = 0
-        for r in range(rows):
-            for c in range(cols):
-                models.append(Electrode(eid=eid, x=r * pitch, y=c * pitch, channel_index=eid, contact_id="A-000"))
+        for r in range(params.rows):
+            for c in range(params.cols):
+                model = Electrode(
+                    eid=eid,
+                    x=c * params.pitch,
+                    y=r * params.pitch,
+                    potentiostat_id=eid,
+                    intan_id=format_intan_id(eid),
+                    shape=params.electrode_shape,
+                )
+                fill_electrode_extras(model, self.attribute_schema)
+                models.append(model)
                 eid += 1
-        self._set_electrodes(models)
+        pads = layout_pads_around_electrodes(
+            models,
+            pad_rows=params.pad_rows,
+            pad_spacing=params.pad_spacing,
+            pad_size=params.pad_size,
+            pad_shape=params.pad_shape,
+            pad_height=params.pad_height,
+        )
+        self._set_array(models, pads)
 
     def _create_new_array_interactive(self) -> None:
-        """
-        Handler for File > New: confirm replacement, open dialog, create grid.
-        """
+        """Handler for File > New: confirm replacement, open dialog, create grid."""
         if not self._confirm_before_replace("create a new array"):
             return
         before = self._capture_state()
         if self._prompt_new_array_parameters():
             self._commit_if_changed(before)
 
-    def _refresh_label_layouts(self) -> None:
-        """
-        Refresh label positions on all electrode items (after zoom/scale change).
-        Labels use ItemIgnoresTransformations; their layout depends on view scale.
-        """
+    def _refresh_label_layouts(self, view=None) -> None:
+        """Refresh label copies for one camera, or both when `view` is None."""
+        view_attr = None
+        if view is self.electrode_view:
+            view_attr = "electrode_map_view"
+        elif view is self.pads_map_view:
+            view_attr = "pad_map_view"
         for item in self.items.values():
-            item._layout_labels()
+            item._layout_labels(view_attr)
+        for item in self.pad_items.values():
+            item._layout_labels(view_attr)
 
-    def _fit_view(self) -> None:
-        """
-        Fit view to frame electrodes with margin and centering.
+    def _fit_target_rect(self, index: int) -> QRectF:
+        """Bounds used to frame a mapping view (electrodes left, pads right)."""
+        if index == TAB_PADS:
+            if self.pads:
+                return self._pad_bounds_rect()
+            if self.electrodes:
+                return self._electrode_bounds_rect()
+            return self._array_bounds_rect()
+        if self.electrodes:
+            return self._electrode_bounds_rect()
+        return self._array_bounds_rect()
 
-        Two spaces managed:
-        - fit_rect: visual framing (electrodes + padding),
-        - sceneRect: larger navigable area for scroll/pan in margins.
-        Centers fit_rect in usable area (excluding axis bands).
+    def _map_views(self) -> tuple[ElectrodeArrayView, ElectrodeArrayView]:
+        """Left (electrodes) and right (pads) mapping cameras."""
+        return self.electrode_view, self.pads_map_view
+
+    def _capture_map_cameras(self) -> list[tuple[ElectrodeArrayView, QPointF]]:
+        """Remember each mapping view's scene point at the viewport center."""
+        return [(view, view.capture_camera()) for view in self._map_views()]
+
+    def _restore_map_cameras(self, cameras: list[tuple[ElectrodeArrayView, QPointF]]) -> None:
+        """Put each mapping view back on the scene point it showed before."""
+        for view, scene_center in cameras:
+            view.restore_camera(scene_center)
+
+    def _ensure_scene_rect(self, extra: QRectF | None = None) -> None:
+        """Keep enough scene margin so the pad view can pan to true center.
+
+        Recalculating the scene rect recenters Qt's AlignCenter cameras, so
+        the current view is restored afterwards. Visible regions are kept in
+        the rect so restoring is not clamped after a shrink.
         """
-        if not self.electrodes:
+        needed = self._array_bounds_rect(margin=DEFAULT_SCENE_MARGIN)
+        if extra is not None:
+            needed = needed.united(extra)
+        current = self.scene.sceneRect()
+        if current.isValid() and not current.isEmpty() and current.contains(needed):
             return
-        base_rect = self._electrode_bounds_rect(margin=0.0)
-        # Padding scales with electrode extent for comfortable framing.
+        array_rect = self._array_bounds_rect(margin=0.0)
+        span = max(array_rect.width(), array_rect.height(), 1.0)
+        margin = max(DEFAULT_SCENE_MARGIN, FIT_PADDING_MIN * 2.0, span)
+        rect = self._array_bounds_rect(margin=margin)
+        if extra is not None:
+            rect = rect.united(extra)
+        cameras = self._capture_map_cameras()
+        for view in self._map_views():
+            visible = view.visible_scene_rect()
+            if visible.isValid() and not visible.isEmpty():
+                rect = rect.united(visible)
+        self.scene.setSceneRect(rect)
+        self._restore_map_cameras(cameras)
+
+    def _fit_graphics_view(self, view: ElectrodeArrayView, base_rect: QRectF) -> None:
+        """Fit one mapping viewport to a scene rect, centered in the plot area."""
         fit_padding = max(FIT_PADDING_MIN, FIT_PADDING_RATIO * max(base_rect.width(), base_rect.height()))
         fit_rect = base_rect.adjusted(-fit_padding, -fit_padding, fit_padding, fit_padding)
-        scene_margin = max(DEFAULT_SCENE_MARGIN, fit_padding * 1.5)
-        self.scene.setSceneRect(self._electrode_bounds_rect(margin=scene_margin))
-        self.view.fitInView(fit_rect, Qt.KeepAspectRatio)
-        # fitInView resets transform; reapply Cartesian orientation (Y up).
-        vp = self.view.viewport().rect()
-        axis_w = AXIS_BAND_WIDTH
-        axis_h = AXIS_BAND_HEIGHT
-        usable_w = max(vp.width() - axis_w, 1)
-        usable_h = max(vp.height() - axis_h, 1)
-        # Center the fit rect in the usable area (excluding axis bands).
-        desired_vp_center = QPoint(axis_w + usable_w // 2, axis_h + usable_h // 2)
-        current_vp_pos = self.view.mapFromScene(fit_rect.center())
-        # Scroll so fit rect center aligns with usable area center.
-        delta_vp = current_vp_pos - desired_vp_center
-        self.view.horizontalScrollBar().setValue(self.view.horizontalScrollBar().value() + delta_vp.x())
-        self.view.verticalScrollBar().setValue(self.view.verticalScrollBar().value() + delta_vp.y())
+        grow = max(fit_rect.width(), fit_rect.height())
+        self._ensure_scene_rect(extra=fit_rect.adjusted(-grow, -grow, grow, grow))
+        view.fit_scene_rect(fit_rect)
+
+    def _fit_view(self) -> None:
+        """Fit both mapping views: electrodes on the left, pads on the right."""
+        self._fit_all_views()
+
+    def _fit_all_views(self) -> None:
+        """Fit each mapping viewport to its target now that both are visible."""
+        if not self.electrodes and not self.pads:
+            return
+        self._fit_graphics_view(self.electrode_view, self._fit_target_rect(TAB_ELECTRODES))
+        self._fit_graphics_view(self.pads_map_view, self._fit_target_rect(TAB_PADS))
         self._refresh_label_layouts()
 
-    def _apply_radius(self) -> None:
-        """
-        Apply radius field value to all selected electrodes.
-
-        Validates radius > 0. Ignored if no selection.
-        """
-        selected = self._selected_items()
-        if not selected:
-            return
-        before = self._capture_state()
-        try:
-            radius = float(self.radius_edit.text())
-            if radius <= 0:
-                raise ValueError
-        except ValueError:
-            # Non-numeric or <= 0 value.
-            QMessageBox.critical(self, "Invalid radius", "Radius must be a positive number.")
-            return
-        for item in selected:
-            item.set_radius(radius)
-            item.sync_from_model()
-        self._refresh_panel_values()
-        # Record undo if effective change.
-        self._commit_if_changed(before)
-
-    def _apply_xy_single(self) -> None:
-        """
-        Set absolute X/Y for a single selected electrode.
-
-        Requires exactly one selection. Validates X and Y are numeric.
-        """
-        selected = self._selected_items()
-        if len(selected) != 1:
-            QMessageBox.information(self, "Single selection required", "Select exactly one electrode.")
-            return
-        before = self._capture_state()
-        try:
-            x = float(self.x_edit.text())
-            y = float(self.y_edit.text())
-        except ValueError:
-            QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
-            return
-        selected[0].setPos(x, y)
-        self._refresh_panel_values()
-        self._commit_if_changed(before)
-
-    def _apply_channel_index(self) -> None:
-        """
-        Apply channel_index to all selected electrodes.
-
-        Updates duplicate flags after modification.
-        """
-        selected = self._selected_items()
-        if not selected:
-            return
-        before = self._capture_state()
-        text = self.channel_index_edit.text().strip()
-        if text == "":
-            QMessageBox.information(self, "No values", "Fill Channel index before applying.")
-            return
-        try:
-            value = int(text)
-        except ValueError:
-            QMessageBox.critical(self, "Invalid channel index", "Channel index must be an integer.")
-            return
-        for item in selected:
-            item.model.channel_index = value
-            item.sync_from_model()
-        self._update_duplicate_flags()
-        self._refresh_panel_values()
-        self._commit_if_changed(before)
-
-    def _apply_contact_id(self) -> None:
-        """
-        Apply contact_id to all selected electrodes.
-
-        Updates duplicate flags after modification.
-        """
-        selected = self._selected_items()
-        if not selected:
-            return
-        before = self._capture_state()
-        text = self.contact_id_edit.text().strip()
-        if text == "":
-            QMessageBox.information(self, "No values", "Fill Contact ID before applying.")
-            return
-        for item in selected:
-            item.model.contact_id = text
-            item.sync_from_model()
-        self._update_duplicate_flags()
-        self._refresh_panel_values()
-        self._commit_if_changed(before)
-
     def _parse_contact_plane_axis_text(self, text: str) -> tuple[float, float, float, float] | None:
-        """
-        Parse axis text: "x0,x1,y0,y1" or space-separated values.
-
-        Returns:
-            (x0, x1, y0, y1) or None if not exactly 4 numeric values.
-        """
+        """Parse axis text: "x0,x1,y0,y1" or space-separated values."""
         parts = [p for p in text.replace(",", " ").split() if p]
         if len(parts) != 4:
             return None
@@ -1134,58 +2051,157 @@ class ElectrodeArrayEditorQt(QMainWindow):
             return None
         return x0, x1, y0, y1
 
-    def _apply_contact_plane_axis(self) -> None:
-        """
-        Apply contact plane axis (x0,x1,y0,y1) to selected electrodes.
+    def _labels_for_electrode(self, model: Electrode) -> tuple[str, str]:
+        """Build map-view label text from the IDs currently checked."""
+        return model.map_view_labels(
+            self.visible_map_label_keys,
+            [spec.key for spec in self.attribute_schema],
+        )
 
-        Parses field text; requires 4 numeric values.
-        """
-        selected = self._selected_items()
-        if not selected:
+    def _refresh_all_map_labels(self) -> None:
+        """Redraw electrode and pad labels after a visibility change."""
+        for item in self.items.values():
+            item._refresh_label()
+        for item in self.pad_items.values():
+            item._refresh_label()
+
+    def _rebuild_map_label_controls(self) -> None:
+        """Rebuild checkbox and View-menu entries from the current schema."""
+        valid_keys = {spec.key for spec in self.attribute_schema}
+        self.visible_map_label_keys &= valid_keys
+        self._rebuild_map_label_checks()
+        self._rebuild_map_label_menu()
+
+    def _rebuild_map_label_checks(self) -> None:
+        """Rebuild the Map labels checkboxes (same IDs as the Electrodes tab)."""
+        layout = self._map_labels_layout
+        if layout is None:
+            return
+        while layout.count():
+            child = layout.takeAt(0)
+            widget = child.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._map_label_checks.clear()
+        for spec in self.attribute_schema:
+            check = QCheckBox(spec.label)
+            check.setChecked(spec.key in self.visible_map_label_keys)
+            check.setToolTip("Show this ID on the electrode and pad views.")
+            check.toggled.connect(
+                lambda checked, key=spec.key: self._set_map_label_visible(key, checked)
+            )
+            self._map_label_checks[spec.key] = check
+            layout.addWidget(check)
+
+    def _rebuild_map_label_menu(self) -> None:
+        """Rebuild View > Map labels checkable actions."""
+        menu = self._view_labels_menu
+        if menu is None:
+            return
+        menu.clear()
+        self._map_label_actions.clear()
+        for spec in self.attribute_schema:
+            action = QAction(spec.label, self)
+            action.setCheckable(True)
+            action.setChecked(spec.key in self.visible_map_label_keys)
+            action.toggled.connect(
+                lambda checked, key=spec.key: self._set_map_label_visible(key, checked)
+            )
+            menu.addAction(action)
+            self._map_label_actions[spec.key] = action
+
+    def _set_map_label_visible(self, key: str, visible: bool) -> None:
+        """Check or uncheck one map-view ID and refresh both views."""
+        already = key in self.visible_map_label_keys
+        if already == bool(visible):
+            return
+        before = None if self._is_restoring_state else self._capture_state()
+        if visible:
+            self.visible_map_label_keys.add(key)
+        else:
+            self.visible_map_label_keys.discard(key)
+        check = self._map_label_checks.get(key)
+        if check is not None and check.isChecked() != visible:
+            check.blockSignals(True)
+            check.setChecked(visible)
+            check.blockSignals(False)
+        action = self._map_label_actions.get(key)
+        if action is not None and action.isChecked() != visible:
+            action.blockSignals(True)
+            action.setChecked(visible)
+            action.blockSignals(False)
+        self._refresh_all_map_labels()
+        if before is not None:
+            self._commit_if_changed(before)
+
+    def _rebuild_attribute_fields(self) -> None:
+        """Rebuild identifier/extra attribute editors from the current file schema."""
+        layout = self.attributes_form
+        while layout.rowCount() > 0:
+            layout.removeRow(0)
+        self.attribute_edits.clear()
+        for spec in self.attribute_schema:
+            edit = QLineEdit("")
+            self.attribute_edits[spec.key] = edit
+            if spec.builtin:
+                layout.addRow(spec.label, edit)
+                continue
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(4)
+            row_layout.addWidget(edit)
+            remove_btn = QPushButton("×")
+            remove_btn.setFixedWidth(28)
+            remove_btn.setToolTip("Remove this attribute from the file")
+            remove_btn.clicked.connect(lambda _checked=False, key=spec.key: self._remove_attribute(key))
+            row_layout.addWidget(remove_btn)
+            layout.addRow(spec.label, row)
+
+    def _set_attribute_schema(self, schema: list[AttributeSpec], *, prune: bool) -> None:
+        """Replace the file-level schema and rebuild the electrode attribute panel."""
+        self.attribute_schema = list(schema)
+        fill_electrodes_extras(self.electrodes.values(), self.attribute_schema, prune=prune)
+        self._rebuild_attribute_fields()
+        self._rebuild_map_label_controls()
+        self._refresh_panel_values()
+        self._sync_electrode_table(reload_data=True)
+        self._refresh_all_map_labels()
+
+    def _add_attribute_interactive(self) -> None:
+        """Open the dialog to add a file-level extra electrode attribute."""
+        dialog = AddAttributeDialog(self.attribute_schema, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        spec = dialog.spec()
+        if spec is None:
+            QMessageBox.information(self, "Add attribute", "Enter a name for the new attribute.")
+            return
+        if any(existing.key == spec.key for existing in self.attribute_schema):
+            QMessageBox.information(self, "Add attribute", f"Attribute « {spec.label} » already exists.")
             return
         before = self._capture_state()
-        text = self.contact_plane_axis_edit.text().strip()
-        if text == "":
-            QMessageBox.information(self, "No values", "Fill Contact plane axis before applying.")
-            return
-        value = self._parse_contact_plane_axis_text(text)
-        if value is None:
-            QMessageBox.critical(self, "Invalid contact plane axis", "Use 4 values: x0, x1, y0, y1.")
-            return
-        for item in selected:
-            item.model.contact_plane_axis = value
-        self._refresh_panel_values()
+        schema = list(self.attribute_schema) + [spec]
+        self._set_attribute_schema(schema, prune=False)
         self._commit_if_changed(before)
 
-    def _apply_shank_id(self) -> None:
-        """
-        Apply shank_id to all selected electrodes.
-        """
-        selected = self._selected_items()
-        if not selected:
+    def _remove_attribute(self, key: str) -> None:
+        """Remove a file-level extra attribute from the schema and all electrodes."""
+        spec = next((item for item in self.attribute_schema if item.key == key), None)
+        if spec is None or spec.builtin:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Remove attribute",
+            f"Remove attribute « {spec.label} » from this file?\nValues on all electrodes will be deleted.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
             return
         before = self._capture_state()
-        text = self.shank_id_edit.text()
-        for item in selected:
-            item.model.shank_id = text
-        self._refresh_panel_values()
-        self._commit_if_changed(before)
-
-    def _apply_shape(self) -> None:
-        """
-        Apply shape to selected electrodes (currently forced to 'circle').
-        """
-        selected = self._selected_items()
-        if not selected:
-            return
-        before = self._capture_state()
-        value = self.shape_combo.currentText().strip().lower() or "circle"
-        if value != "circle":
-            value = "circle"
-        for item in selected:
-            item.model.shape = value
-            item.sync_from_model()
-        self._refresh_panel_values()
+        schema = [item for item in self.attribute_schema if item.key != key]
+        self._set_attribute_schema(schema, prune=True)
         self._commit_if_changed(before)
 
     def _apply_pending_edits(self) -> None:
@@ -1195,22 +2211,42 @@ class ElectrodeArrayEditorQt(QMainWindow):
         Empty text fields are treated as "no change". For X/Y, both values must
         be provided together and require exactly one selected electrode.
         """
-        selected = self._selected_items()
+        selected = self._selected_electrode_items()
         if not selected:
             return
-
         radius_text = self.radius_edit.text().strip()
+        height_text = self.height_edit.text().strip()
         x_text = self.x_edit.text().strip()
         y_text = self.y_edit.text().strip()
-        channel_text = self.channel_index_edit.text().strip()
-        contact_text = self.contact_id_edit.text().strip()
         plane_text = self.contact_plane_axis_edit.text().strip()
-        shank_raw_text = self.shank_id_edit.text()
-        shank_text = shank_raw_text
-        shape_value = self.shape_combo.currentText().strip().lower() or "circle"
+        shape_text = self.shape_combo.currentText()
+        apply_shape = shape_text != MIXED_SHAPE_LABEL
+        shape_value = (
+            normalize_contact_shape(shape_text, DEFAULT_SHAPE) if apply_shape else None
+        )
 
-        if shape_value != "circle":
-            shape_value = "circle"
+        parsed_attributes: dict[str, str | int | float] = {}
+        single = len(selected) == 1
+        for spec in self.attribute_schema:
+            edit = self.attribute_edits.get(spec.key)
+            if edit is None:
+                continue
+            raw = edit.text()
+            if raw == "":
+                # Single selection: empty string fields clear the value.
+                # Multi-selection: empty still means "leave unchanged".
+                if single and spec.value_type == "str":
+                    parsed_attributes[spec.key] = ""
+                continue
+            try:
+                parsed_attributes[spec.key] = parse_user_value(spec, raw)
+            except ValueError:
+                QMessageBox.critical(
+                    self,
+                    f"Invalid {spec.label}",
+                    f"{spec.label} must be a valid {spec.value_type}.",
+                )
+                return
 
         if (x_text and not y_text) or (y_text and not x_text):
             QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
@@ -1221,14 +2257,29 @@ class ElectrodeArrayEditorQt(QMainWindow):
 
         before = self._capture_state()
 
-        radius_value: float | None = None
+        radius_field: float | None = None
         if radius_text:
             try:
-                radius_value = float(radius_text)
-                if radius_value <= 0:
+                radius_field = float(radius_text)
+                if radius_field <= 0:
                     raise ValueError
             except ValueError:
-                QMessageBox.critical(self, "Invalid radius", "Radius must be a positive number.")
+                size_name = primary_size_field_label(shape_value or DEFAULT_SHAPE)
+                QMessageBox.critical(
+                    self,
+                    f"Invalid {size_name.lower()}",
+                    f"{size_name} must be a positive number.",
+                )
+                return
+
+        height_field: float | None = None
+        if height_text:
+            try:
+                height_field = float(height_text)
+                if height_field <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.critical(self, "Invalid height", "Height must be a positive number.")
                 return
 
         x_value: float | None = None
@@ -1241,14 +2292,6 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
                 return
 
-        channel_value: int | None = None
-        if channel_text:
-            try:
-                channel_value = int(channel_text)
-            except ValueError:
-                QMessageBox.critical(self, "Invalid channel index", "Channel index must be an integer.")
-                return
-
         plane_value: tuple[float, float, float, float] | None = None
         if plane_text:
             plane_value = self._parse_contact_plane_axis_text(plane_text)
@@ -1256,39 +2299,51 @@ class ElectrodeArrayEditorQt(QMainWindow):
                 QMessageBox.critical(self, "Invalid contact plane axis", "Use 4 values: x0, x1, y0, y1.")
                 return
 
-        if contact_text == "" and self.contact_id_edit.text() != "":
-            QMessageBox.information(self, "No values", "Fill Contact ID before applying.")
-            return
-
         for item in selected:
-            if radius_value is not None:
-                item.set_radius(radius_value)
-            if channel_value is not None:
-                item.model.channel_index = channel_value
-            if contact_text:
-                item.model.contact_id = contact_text
+            item_shape = (
+                shape_value
+                if apply_shape
+                else normalize_contact_shape(item.model.shape, DEFAULT_SHAPE)
+            )
+            if apply_shape:
+                item.model.shape = item_shape
+            if radius_field is not None:
+                item.set_radius(stored_half_from_size_field(item_shape, radius_field))
             if plane_value is not None:
                 item.model.contact_plane_axis = plane_value
-            if shank_raw_text != "":
-                item.model.shank_id = shank_text
-            item.model.shape = shape_value
+            for key, value in parsed_attributes.items():
+                item.model.set_attribute(key, value)
+            if shape_uses_height(item_shape):
+                if height_field is not None:
+                    item.set_height(stored_half_from_size_field("rect", height_field))
+                elif item.model.height <= 0:
+                    item.set_height(item.model.radius)
             item.sync_from_model()
 
         if x_value is not None and y_value is not None:
             selected[0].setPos(x_value, y_value)
 
         self._update_duplicate_flags()
+        self._refresh_pad_electrode_combo()
+        self._refresh_pad_add_electrode_combo()
+        self._ensure_scene_rect()
         self._refresh_panel_values()
+        self._sync_electrode_table(reload_data=True)
         self._commit_if_changed(before)
 
     def _move_selection_by_delta(self) -> None:
-        """
-        Move selected electrodes by (dX, dY).
-
-        Reads dX and dY from panel fields; validates they are numeric.
-        """
-        selected = self._selected_items()
-        if not selected:
+        """Move selected electrodes and pads by (dX, dY)."""
+        electrodes = [
+            item
+            for item in self._selected_electrode_items()
+            if item.model.eid not in self._auto_selected_electrode_eids
+        ]
+        pads = [
+            item
+            for item in self._selected_pad_items()
+            if item.model.pad_id not in self._auto_selected_pad_ids
+        ]
+        if not electrodes and not pads:
             return
         before = self._capture_state()
         try:
@@ -1297,97 +2352,399 @@ class ElectrodeArrayEditorQt(QMainWindow):
         except ValueError:
             QMessageBox.critical(self, "Invalid dX/dY", "dX and dY must be numeric values.")
             return
-        for item in selected:
+        for item in electrodes + pads:
             p = item.pos()
             item.setPos(p.x() + dx, p.y() + dy)
         self._refresh_panel_values()
+        self._sync_electrode_table(reload_data=True)
         self._commit_if_changed(before)
 
-    def _delete_selected(self) -> None:
-        """
-        Delete all selected electrodes.
-        """
-        selected = self._selected_items()
+    def _delete_selected_electrodes(self) -> None:
+        """Delete selected electrodes and the pads associated with them."""
+        selected = self._selected_electrode_items()
         if not selected:
             return
         before = self._capture_state()
         selected_eids = {item.model.eid for item in selected}
         models = [m for m in self.electrodes.values() if m.eid not in selected_eids]
-        self._set_electrodes(models)
+        pads = [p for p in self.pads.values() if p.electrode_eid not in selected_eids]
+        self._set_array(models, pads)
         self._commit_if_changed(before)
 
-    def _toggle_enabled(self) -> None:
-        """
-        Invert enabled flag for each selected electrode.
-        """
-        selected = self._selected_items()
+    def _delete_selected_pads(self) -> None:
+        """Delete selected pads only."""
+        selected = self._selected_pad_items()
         if not selected:
             return
         before = self._capture_state()
+        selected_pad_ids = {item.model.pad_id for item in selected}
+        pads = [p for p in self.pads.values() if p.pad_id not in selected_pad_ids]
+        self._set_array(list(self.electrodes.values()), pads)
+        self._commit_if_changed(before)
+
+    def _delete_selected(self) -> None:
+        """Delete selected electrodes (and their pads) and selected pads.
+
+        Items selected only because their associated counterpart is selected
+        are not deleted on their own.
+        """
+        electrodes = [
+            item
+            for item in self._selected_electrode_items()
+            if item.model.eid not in self._auto_selected_electrode_eids
+        ]
+        pads = [
+            item
+            for item in self._selected_pad_items()
+            if item.model.pad_id not in self._auto_selected_pad_ids
+        ]
+        if not electrodes and not pads:
+            return
+        before = self._capture_state()
+        selected_eids = {item.model.eid for item in electrodes}
+        selected_pad_ids = {item.model.pad_id for item in pads}
+        models = [m for m in self.electrodes.values() if m.eid not in selected_eids]
+        remaining_pads = [
+            p
+            for p in self.pads.values()
+            if p.pad_id not in selected_pad_ids and p.electrode_eid not in selected_eids
+        ]
+        self._set_array(models, remaining_pads)
+        self._commit_if_changed(before)
+
+    def _apply_pending_pad_edits(self) -> None:
+        """
+        Apply all non-empty pad-panel fields in one confirmation action.
+
+        Empty text fields are treated as "no change". For X/Y, both values must
+        be provided together and require exactly one selected pad.
+        """
+        selected = self._selected_pad_items()
+        if not selected:
+            return
+
+        radius_text = self.pad_radius_edit.text().strip()
+        height_text = self.pad_height_edit.text().strip()
+        x_text = self.pad_x_edit.text().strip()
+        y_text = self.pad_y_edit.text().strip()
+        electrode_eid = self.pad_electrode_combo.currentData()
+        shape_text = self.pad_shape_combo.currentText()
+        apply_shape = shape_text != MIXED_SHAPE_LABEL
+        shape_value = (
+            normalize_contact_shape(shape_text, DEFAULT_PAD_SHAPE) if apply_shape else None
+        )
+
+        if (x_text and not y_text) or (y_text and not x_text):
+            QMessageBox.critical(self, "Invalid X/Y", "Fill both X and Y or leave both empty.")
+            return
+        if (x_text or y_text) and len(selected) != 1:
+            QMessageBox.information(self, "Single selection required", "X/Y edition requires exactly one pad.")
+            return
+
+        if electrode_eid is not None and electrode_eid != -1 and electrode_eid not in self.electrodes:
+            QMessageBox.critical(self, "Invalid electrode", "The associated electrode does not exist.")
+            return
+        if electrode_eid is not None and electrode_eid != -1:
+            selected_pad_ids = {item.model.pad_id for item in selected}
+            if len(selected) > 1:
+                QMessageBox.information(
+                    self,
+                    "Unique pad pairing",
+                    "Each electrode can be linked to only one pad. "
+                    "Select a single pad to change its associated electrode.",
+                )
+                return
+            taken = self._taken_electrode_eids(except_pad_ids=selected_pad_ids)
+            if electrode_eid in taken:
+                QMessageBox.information(
+                    self,
+                    "Unique pad pairing",
+                    "That electrode already has a pad. Choose an electrode without a pad.",
+                )
+                return
+
+        before = self._capture_state()
+
+        radius_field: float | None = None
+        if radius_text:
+            try:
+                radius_field = float(radius_text)
+                if radius_field <= 0:
+                    raise ValueError
+            except ValueError:
+                size_name = primary_size_field_label(shape_value or DEFAULT_PAD_SHAPE)
+                QMessageBox.critical(
+                    self,
+                    f"Invalid {size_name.lower()}",
+                    f"{size_name} must be a positive number.",
+                )
+                return
+
+        height_field: float | None = None
+        if height_text:
+            try:
+                height_field = float(height_text)
+                if height_field <= 0:
+                    raise ValueError
+            except ValueError:
+                QMessageBox.critical(self, "Invalid height", "Height must be a positive number.")
+                return
+
+        x_value: float | None = None
+        y_value: float | None = None
+        if x_text and y_text:
+            try:
+                x_value = float(x_text)
+                y_value = float(y_text)
+            except ValueError:
+                QMessageBox.critical(self, "Invalid X/Y", "X and Y must be numeric values.")
+                return
+
         for item in selected:
-            item.model.enabled = not item.model.enabled
+            item_shape = (
+                shape_value
+                if apply_shape
+                else normalize_contact_shape(item.model.shape, DEFAULT_PAD_SHAPE)
+            )
+            if electrode_eid is not None:
+                item.model.electrode_eid = int(electrode_eid)
+            if apply_shape:
+                item.model.shape = item_shape
+            if radius_field is not None:
+                item.set_radius(stored_half_from_size_field(item_shape, radius_field))
+            if shape_uses_height(item_shape):
+                if height_field is not None:
+                    item.set_height(stored_half_from_size_field("rect", height_field))
+                elif item.model.height <= 0:
+                    item.set_height(item.model.radius)
             item.sync_from_model()
+
+        if x_value is not None and y_value is not None:
+            selected[0].setPos(x_value, y_value)
+
+        self._update_duplicate_flags()
+        self._refresh_pad_add_electrode_combo()
+        self._ensure_scene_rect()
         self._refresh_panel_values()
+        self._sync_electrode_table(reload_data=True)
         self._commit_if_changed(before)
 
     def _refresh_panel_values(self) -> None:
         """
         Update side panel fields according to selection.
 
-        - 0 selections: empty fields.
-        - 1 selection: all electrode values.
-        - N selections: common values or empty if mixed.
+        Electrode tab and pad tab are filled independently from their selections.
+        A homogeneous selection switches to the matching parameterization tab.
         """
-        selected = self._selected_items()
-        self.selected_count_label.setText(str(len(selected)))
+        electrodes = self._selected_electrode_items()
+        pads = self._selected_pad_items()
+        self.selected_count_label.setText(f"{len(electrodes)} electrode(s), {len(pads)} pad(s)")
 
-        # Single selection: show all editable fields.
+        user_pads = [it for it in pads if it.model.pad_id not in self._auto_selected_pad_ids]
+        user_electrodes = [
+            it for it in electrodes if it.model.eid not in self._auto_selected_electrode_eids
+        ]
+        if (
+            not self._is_restoring_state
+            and not self.is_add_pad_mode
+            and not self.is_add_mode
+        ):
+            if user_pads and self.point_tabs.currentIndex() != TAB_PADS:
+                self.point_tabs.blockSignals(True)
+                self.point_tabs.setCurrentIndex(TAB_PADS)
+                self.point_tabs.blockSignals(False)
+            elif user_electrodes and not user_pads and self.point_tabs.currentIndex() != TAB_ELECTRODES:
+                self.point_tabs.blockSignals(True)
+                self.point_tabs.setCurrentIndex(TAB_ELECTRODES)
+                self.point_tabs.blockSignals(False)
+
+        self._fill_electrode_panel(electrodes)
+        self._fill_pad_panel(pads)
+        self._sync_electrode_table(reload_data=False)
+
+    def _fill_attribute_edits(self, models: list[Electrode]) -> None:
+        """Fill schema-driven attribute editors from one or many electrodes."""
+        if not models:
+            for edit in self.attribute_edits.values():
+                edit.setText("")
+            return
+        if len(models) == 1:
+            model = models[0]
+            for spec in self.attribute_schema:
+                edit = self.attribute_edits.get(spec.key)
+                if edit is None:
+                    continue
+                edit.setText(str(model.get_attribute(spec.key)))
+            return
+        for spec in self.attribute_schema:
+            edit = self.attribute_edits.get(spec.key)
+            if edit is None:
+                continue
+            values = [model.get_attribute(spec.key) for model in models]
+            edit.setText(str(values[0]) if all(value == values[0] for value in values) else "")
+
+    def _fill_electrode_panel(self, selected: list[ElectrodeView]) -> None:
+        """Fill electrode parameterization fields from the current selection."""
         if len(selected) == 1:
             m = selected[0].model
-            # Fill all fields with model values.
-            self.radius_edit.setText(f"{m.radius:.2f}")
+            shape = normalize_contact_shape(m.shape, DEFAULT_SHAPE)
+            self._set_shape_combo(self.shape_combo, ELECTRODE_SHAPES, shape, mixed=False)
+            self._set_electrode_size_label(shape)
+            self.radius_edit.setText(f"{size_field_from_stored_half(shape, m.radius):.2f}")
+            half_h = effective_half_height(shape, m.radius, m.height)
+            self.height_edit.setText(f"{size_field_from_stored_half('rect', half_h):.2f}")
+            self._set_height_row_visible(
+                self._electrode_geom_form,
+                self.electrode_height_label,
+                self.height_edit,
+                shape_uses_height(shape),
+            )
             self.x_edit.setText(f"{m.x:.2f}")
             self.y_edit.setText(f"{m.y:.2f}")
-            self.channel_index_edit.setText(str(m.channel_index))
-            self.contact_id_edit.setText(m.contact_id)
             x0, x1, y0, y1 = m.contact_plane_axis
             self.contact_plane_axis_edit.setText(f"{x0:g}, {x1:g}, {y0:g}, {y1:g}")
-            self.shank_id_edit.setText(m.shank_id)
-            self.shape_combo.setCurrentText(m.shape if m.shape else "circle")
+            self._fill_attribute_edits([m])
             return
 
-        # Multi-selection: show common values or empty when mixed.
         if len(selected) > 1:
-            # Extract values from each electrode.
-            radii = [it.model.radius for it in selected]
-            channels = [it.model.channel_index for it in selected]
-            contacts = [it.model.contact_id for it in selected]
+            shapes = [normalize_contact_shape(it.model.shape, DEFAULT_SHAPE) for it in selected]
+            mixed_shape = not all(s == shapes[0] for s in shapes)
+            common_shape = shapes[0] if not mixed_shape else DEFAULT_SHAPE
+            sizes = [size_field_from_stored_half(it.model.shape, it.model.radius) for it in selected]
             axes = [it.model.contact_plane_axis for it in selected]
-            shanks = [it.model.shank_id for it in selected]
-            # Show common value or empty if mixed.
-            self.radius_edit.setText(f"{radii[0]:.2f}" if max(radii) - min(radii) < 1e-9 else "")
-            self.channel_index_edit.setText(str(channels[0]) if min(channels) == max(channels) else "")
-            self.contact_id_edit.setText(contacts[0] if all(c == contacts[0] for c in contacts) else "")
+            self._set_shape_combo(self.shape_combo, ELECTRODE_SHAPES, common_shape, mixed=mixed_shape)
+            if mixed_shape:
+                self._electrode_size_shape = MIXED_SHAPE_LABEL
+                self.electrode_size_label.setText("Size")
+            else:
+                self._set_electrode_size_label(common_shape)
+            self.radius_edit.setText(f"{sizes[0]:.2f}" if max(sizes) - min(sizes) < 1e-9 else "")
+            if not mixed_shape and shape_uses_height(common_shape):
+                heights = [
+                    size_field_from_stored_half(
+                        "rect",
+                        effective_half_height(it.model.shape, it.model.radius, it.model.height),
+                    )
+                    for it in selected
+                ]
+                self.height_edit.setText(f"{heights[0]:.2f}" if max(heights) - min(heights) < 1e-9 else "")
+            else:
+                self.height_edit.setText("")
+            self._set_height_row_visible(
+                self._electrode_geom_form,
+                self.electrode_height_label,
+                self.height_edit,
+                (not mixed_shape) and shape_uses_height(common_shape),
+            )
             if all(a == axes[0] for a in axes):
                 x0, x1, y0, y1 = axes[0]
                 self.contact_plane_axis_edit.setText(f"{x0:g}, {x1:g}, {y0:g}, {y1:g}")
             else:
                 self.contact_plane_axis_edit.setText("")
-            self.shank_id_edit.setText(shanks[0] if all(s == shanks[0] for s in shanks) else "")
-            self.shape_combo.setCurrentText("circle")
             self.x_edit.setText("")
             self.y_edit.setText("")
+            self._fill_attribute_edits([it.model for it in selected])
             return
 
-        # No selection: clear all panel fields.
         self.radius_edit.setText("")
+        self.height_edit.setText("")
         self.x_edit.setText("")
         self.y_edit.setText("")
-        self.channel_index_edit.setText("")
-        self.contact_id_edit.setText("")
         self.contact_plane_axis_edit.setText("")
-        self.shank_id_edit.setText("")
-        self.shape_combo.setCurrentText("circle")
+        self._set_shape_combo(self.shape_combo, ELECTRODE_SHAPES, DEFAULT_SHAPE, mixed=False)
+        self._set_electrode_size_label(DEFAULT_SHAPE)
+        self._set_height_row_visible(
+            self._electrode_geom_form,
+            self.electrode_height_label,
+            self.height_edit,
+            False,
+        )
+        self._fill_attribute_edits([])
+
+    def _fill_pad_panel(self, selected: list[PadView]) -> None:
+        """Fill pad parameterization fields from the current selection."""
+        if len(selected) == 1:
+            m = selected[0].model
+            shape = normalize_contact_shape(m.shape, DEFAULT_PAD_SHAPE)
+            self._set_shape_combo(self.pad_shape_combo, PAD_SHAPES, shape, mixed=False)
+            self._set_pad_size_label(shape)
+            self.pad_radius_edit.setText(f"{size_field_from_stored_half(shape, m.radius):.2f}")
+            half_h = effective_half_height(shape, m.radius, m.height)
+            self.pad_height_edit.setText(f"{size_field_from_stored_half('rect', half_h):.2f}")
+            self._set_height_row_visible(
+                self._pad_form,
+                self.pad_height_label,
+                self.pad_height_edit,
+                shape_uses_height(shape),
+            )
+            self.pad_x_edit.setText(f"{m.x:.2f}")
+            self.pad_y_edit.setText(f"{m.y:.2f}")
+            self.pad_id_edit.setText(str(m.pad_id))
+            self._refresh_pad_electrode_combo(
+                selected_eid=m.electrode_eid,
+                mixed=False,
+                keep_eids={m.electrode_eid},
+            )
+            return
+
+        if len(selected) > 1:
+            sizes = [size_field_from_stored_half(it.model.shape, it.model.radius) for it in selected]
+            eids = [it.model.electrode_eid for it in selected]
+            pad_ids = [it.model.pad_id for it in selected]
+            shapes = [normalize_contact_shape(it.model.shape, DEFAULT_PAD_SHAPE) for it in selected]
+            mixed_eid = not all(eid == eids[0] for eid in eids)
+            mixed_shape = not all(s == shapes[0] for s in shapes)
+            common_shape = shapes[0] if not mixed_shape else DEFAULT_PAD_SHAPE
+            self._set_shape_combo(self.pad_shape_combo, PAD_SHAPES, common_shape, mixed=mixed_shape)
+            if mixed_shape:
+                self._pad_size_shape = MIXED_SHAPE_LABEL
+                self.pad_size_label.setText("Size")
+            else:
+                self._set_pad_size_label(common_shape)
+            self.pad_radius_edit.setText(f"{sizes[0]:.2f}" if max(sizes) - min(sizes) < 1e-9 else "")
+            if not mixed_shape and shape_uses_height(common_shape):
+                heights = [
+                    size_field_from_stored_half(
+                        "rect",
+                        effective_half_height(it.model.shape, it.model.radius, it.model.height),
+                    )
+                    for it in selected
+                ]
+                self.pad_height_edit.setText(f"{heights[0]:.2f}" if max(heights) - min(heights) < 1e-9 else "")
+            else:
+                self.pad_height_edit.setText("")
+            self._set_height_row_visible(
+                self._pad_form,
+                self.pad_height_label,
+                self.pad_height_edit,
+                (not mixed_shape) and shape_uses_height(common_shape),
+            )
+            self.pad_id_edit.setText(
+                str(pad_ids[0]) if all(value == pad_ids[0] for value in pad_ids) else ""
+            )
+            self.pad_x_edit.setText("")
+            self.pad_y_edit.setText("")
+            self._refresh_pad_electrode_combo(
+                selected_eid=None if mixed_eid else eids[0],
+                mixed=mixed_eid,
+                keep_eids=set(eids),
+            )
+            return
+
+        self.pad_radius_edit.setText("")
+        self.pad_height_edit.setText("")
+        self.pad_x_edit.setText("")
+        self.pad_y_edit.setText("")
+        self.pad_id_edit.setText("")
+        self._set_shape_combo(self.pad_shape_combo, PAD_SHAPES, DEFAULT_PAD_SHAPE, mixed=False)
+        self._set_pad_size_label(DEFAULT_PAD_SHAPE)
+        self._set_height_row_visible(
+            self._pad_form,
+            self.pad_height_label,
+            self.pad_height_edit,
+            False,
+        )
+        self._refresh_pad_electrode_combo()
 
 
 def run_app() -> None:
@@ -1397,6 +2754,9 @@ def run_app() -> None:
     Creates QApplication, ElectrodeArrayEditorQt window, shows and runs event loop.
     """
     app = QApplication([])
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(__version__)
+    app.setOrganizationName("Wireless Neural Interface Team")
     win = ElectrodeArrayEditorQt()
     win.show()
     win.raise_()
@@ -1406,4 +2766,3 @@ def run_app() -> None:
 
 if __name__ == "__main__":
     run_app()
-

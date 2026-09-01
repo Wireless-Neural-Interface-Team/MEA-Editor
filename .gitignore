@@ -6,4 +6,6 @@ build/
 .eggs/
 __pycache__/
 *.spec
+.venv/
+si_env/
 MEA_RdLGN64.json

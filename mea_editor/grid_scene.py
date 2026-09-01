@@ -25,7 +25,29 @@ class GridScene(QGraphicsScene):
         """Initialize scene with default axes provider (empty lists)."""
         super().__init__(parent)
         # Default: no axes (empty lists).
-        self._axes_provider = lambda: ([], [])
+        self._axes_provider = lambda view=None: ([], [])
+        # Last focused mapping view (for generic helpers).
+        self.active_view = None
+        # Dedicated cameras so electrode/pad labels follow their own zoom.
+        self.electrode_map_view = None
+        self.pad_map_view = None
+
+    def view_scale(self, preferred_view=None) -> float:
+        """
+        Scale of a mapping view (scene units per pixel).
+
+        Labels use ItemIgnoresTransformations. Each contact has one copy per
+        camera so zooming a view only moves that view's text.
+        """
+        view = preferred_view if preferred_view is not None else self.active_view
+        if view is None:
+            views = self.views()
+            if not views:
+                return 1.0
+            view = views[0]
+        t = view.transform()
+        scale = abs(t.m11()) if t.m11() != 0 else 1.0
+        return max(scale, 1e-6)
 
     def set_axes_provider(self, provider) -> None:
         """
@@ -36,11 +58,14 @@ class GridScene(QGraphicsScene):
         """
         self._axes_provider = provider
 
-    def get_axes(self) -> tuple[list[float], list[float]]:
+    def get_axes(self, view=None) -> tuple[list[float], list[float]]:
         """
         Return current X/Y coordinates for grid and axes.
+
+        Args:
+            view: Mapping viewport requesting the axes, or None.
 
         Returns:
             (xs, ys): sorted lists of unique abscissas and ordinates.
         """
-        return self._axes_provider()
+        return self._axes_provider(view)

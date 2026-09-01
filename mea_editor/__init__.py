@@ -1,22 +1,66 @@
 """
-MEA Editor - GUI and library to create and modify MEA compatible with probeinterface.
+MEA Editor - GUI and library to create and modify MEA arrays.
 
-This package provides:
-- Electrode: data model for electrode/contact
-- load_electrodes_from_file, save_electrodes_to_file: I/O for probeinterface JSON
-- ElectrodeArrayEditorQt, run_app(): Qt GUI editor
+Native files use mea_editor JSON. SpikeInterface export writes probeinterface JSON.
+XLSX exports cover analysis tables and the full electrode + pad workbook.
+
+The Qt GUI is imported lazily so I/O and library use do not require a working
+PySide6 display.
 """
 
-from .electrode import Electrode
-from .electrode_array_editor_io import load_electrodes_from_file, save_electrodes_to_file
-from .electrode_array_editor_qt import ElectrodeArrayEditorQt, run_app
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+from ._version import __version__
+from .attribute_schema import AttributeSpec, default_schema
+from .electrode import Electrode, ElectrodeSnapshot
+from .electrode_array_editor_io import (
+    ArrayDocument,
+    export_analysis_xlsx,
+    export_array_xlsx,
+    export_spikeinterface_json,
+    load_array_document,
+    load_array_from_file,
+    load_electrodes_from_file,
+    save_array_to_file,
+    save_electrodes_to_file,
+)
+from .pad import Pad, PadSnapshot
+
+if TYPE_CHECKING:
+    from .electrode_array_editor_qt import ElectrodeArrayEditorQt, run_app
 
 __all__ = [
+    "__version__",
+    "ArrayDocument",
+    "AttributeSpec",
     "Electrode",
+    "ElectrodeSnapshot",
+    "Pad",
+    "PadSnapshot",
+    "default_schema",
+    "load_array_document",
+    "load_array_from_file",
     "load_electrodes_from_file",
+    "save_array_to_file",
     "save_electrodes_to_file",
+    "export_spikeinterface_json",
+    "export_analysis_xlsx",
+    "export_array_xlsx",
     "ElectrodeArrayEditorQt",
     "run_app",
 ]
 
-__version__ = "0.1.0"
+
+def __getattr__(name: str) -> Any:
+    if name in {"ElectrodeArrayEditorQt", "run_app"}:
+        from .electrode_array_editor_qt import ElectrodeArrayEditorQt, run_app
+
+        values = {
+            "ElectrodeArrayEditorQt": ElectrodeArrayEditorQt,
+            "run_app": run_app,
+        }
+        globals()[name] = values[name]
+        return values[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
